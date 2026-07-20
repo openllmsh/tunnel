@@ -8,8 +8,7 @@
     "./*": "./*.ts"
   },
   "dependencies": {
-    "@openllmsh/protocol": "workspace:*",
-    "effect": ">=3.20.0"
+    "@openllmsh/protocol": "workspace:*"
   },
   "license": "BUSL-1.1"
 }

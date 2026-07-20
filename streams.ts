@@ -32,7 +32,10 @@ const unknownReset = (payload: Uint8Array): Error => {
   return new Error(parsed?.message ?? parsed?.code ?? "stream reset");
 };
 
-const bodyFromStream = (stream: TMuxStream): ReadableStream<Uint8Array> =>
+const bodyFromStream = (
+  stream: TMuxStream,
+  onReset?: () => void,
+): ReadableStream<Uint8Array> =>
   new ReadableStream<Uint8Array>({
     start(controller) {
       const offData = stream.onData((bytes) => controller.enqueue(bytes));
@@ -46,6 +49,7 @@ const bodyFromStream = (stream: TMuxStream): ReadableStream<Uint8Array> =>
         offData();
         offEnd();
         offReset();
+        onReset?.();
         controller.error(unknownReset(payload));
       });
     },
@@ -252,14 +256,19 @@ export const sessionStream = (
   });
 };
 
-export type TServeTunnel = (
-  open: TTunnelStreamOpenPayload,
-  body: ReadableStream<Uint8Array>,
-) => Promise<{
+export type TServeTunnelResponse = {
   readonly status: number;
   readonly headers?: TTunnelResponseHeaders;
   readonly body: ReadableStream<Uint8Array> | Uint8Array | null;
-}>;
+  /** Runs after the response body completes, errors, or the peer resets. */
+  readonly onComplete?: () => void;
+};
+
+export type TServeTunnel = (
+  open: TTunnelStreamOpenPayload,
+  body: ReadableStream<Uint8Array>,
+  signal: AbortSignal,
+) => Promise<TServeTunnelResponse>;
 
 export type TServeSession = (
   stream: TMuxStream,
@@ -269,44 +278,64 @@ export type TServeSession = (
 export type TServeStreamsOptions = {
   readonly tunnel: TServeTunnel;
   readonly session?: TServeSession;
+  /** Reject a valid tunnel OPEN before dispatch, using host-specific wire semantics. */
+  readonly admitTunnel?: (
+    open: TTunnelStreamOpenPayload,
+  ) => TStreamResetCode | null;
+  /** Hosts that preserve a legacy malformed-OPEN code can override the default. */
+  readonly invalidOpenCode?: TStreamResetCode;
 };
 
 const sendResponse = async (
   stream: TMuxStream,
-  response: Awaited<ReturnType<TServeTunnel>>,
+  response: TServeTunnelResponse,
+  signal: AbortSignal,
 ): Promise<void> => {
-  stream.sendCtrl(
-    encodeJsonPayload({
-      t: "res_head",
-      status: response.status,
-      ...(response.headers === undefined
-        ? {}
-        : { res_headers: response.headers }),
-    }),
-  );
-  if (response.body instanceof Uint8Array) {
-    if (response.body.byteLength > 0) await stream.write(response.body);
-  } else if (response.body !== null) {
-    const reader = response.body.getReader();
-    try {
-      for (;;) {
-        const next = await reader.read();
-        if (next.done) break;
-        for (
-          let offset = 0;
-          offset < next.value.byteLength;
-          offset += MAX_PAYLOAD_BYTES
-        ) {
-          await stream.write(
-            next.value.subarray(offset, offset + MAX_PAYLOAD_BYTES),
-          );
-        }
+  try {
+    if (signal.aborted) return;
+    stream.sendCtrl(
+      encodeJsonPayload({
+        t: "res_head",
+        status: response.status,
+        ...(response.headers === undefined
+          ? {}
+          : { res_headers: response.headers }),
+      }),
+    );
+    if (response.body instanceof Uint8Array) {
+      if (response.body.byteLength > 0 && !signal.aborted) {
+        await stream.write(response.body);
       }
-    } finally {
-      reader.releaseLock();
+    } else if (response.body !== null) {
+      const reader = response.body.getReader();
+      const cancel = (): void => {
+        void reader.cancel().catch(() => {});
+      };
+      signal.addEventListener("abort", cancel, { once: true });
+      try {
+        for (;;) {
+          const next = await reader.read();
+          if (next.done || signal.aborted) break;
+          for (
+            let offset = 0;
+            offset < next.value.byteLength;
+            offset += MAX_PAYLOAD_BYTES
+          ) {
+            if (signal.aborted) break;
+            await stream.write(
+              next.value.subarray(offset, offset + MAX_PAYLOAD_BYTES),
+            );
+          }
+        }
+      } finally {
+        signal.removeEventListener("abort", cancel);
+        reader.releaseLock();
+      }
     }
+    if (!signal.aborted) stream.end();
+  } finally {
+    response.onComplete?.();
   }
-  stream.end();
 };
 
 /** Bind application-level OPEN payloads to a serving mux channel. */
@@ -323,7 +352,12 @@ export const serveStream =
   (stream, payload) => {
     const open = parseStreamOpenPayload(decodeJsonPayload(payload));
     if (open === null) {
-      stream.reset(streamReset("protocol_error", "invalid OPEN payload"));
+      stream.reset(
+        streamReset(
+          options.invalidOpenCode ?? "protocol_error",
+          "invalid OPEN payload",
+        ),
+      );
       return;
     }
     if (open.kind === "session") {
@@ -336,8 +370,19 @@ export const serveStream =
       });
       return;
     }
+    const rejected = options.admitTunnel?.(open);
+    if (rejected !== undefined && rejected !== null) {
+      stream.reset(streamReset(rejected));
+      return;
+    }
+    const abort = new AbortController();
+    const offReset = stream.onReset(() => abort.abort());
+    const body = bodyFromStream(stream, () => abort.abort());
     void options
-      .tunnel(open, bodyFromStream(stream))
-      .then((response) => sendResponse(stream, response))
-      .catch(() => stream.reset(streamReset("dispatch_failed")));
+      .tunnel(open, body, abort.signal)
+      .then((response) => sendResponse(stream, response, abort.signal))
+      .catch(() => {
+        if (!abort.signal.aborted) stream.reset(streamReset("dispatch_failed"));
+      })
+      .finally(offReset);
   };

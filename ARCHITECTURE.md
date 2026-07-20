@@ -1,9 +1,10 @@
 # `packages/tunnel` Architecture
 
 > `@openllmsh/tunnel` is the P1 sans-I/O binary mux used between a consumer,
-> the blind relay, and a serving daemon. It depends only on
-> `@openllmsh/protocol` and Effect Schema: no DOM, WebSocket implementation,
-> Bun, timers, crypto transport, database, proxy pipeline, or framework.
+> the blind relay, and a serving daemon. It depends directly only on
+> `@openllmsh/protocol` (which owns the Effect Schema contract): no DOM,
+> WebSocket implementation, Bun, timers, crypto transport, database, proxy
+> pipeline, or framework.
 
 | Layer | Responsibility | Must not know |
 | --- | --- | --- |
