@@ -1,0 +1,15 @@
+{
+  "name": "@openllmsh/tunnel",
+  "version": "0.0.0",
+  "private": false,
+  "type": "module",
+  "exports": {
+    ".": "./index.ts",
+    "./*": "./*.ts"
+  },
+  "dependencies": {
+    "@openllmsh/protocol": "workspace:*",
+    "effect": ">=3.20.0"
+  },
+  "license": "BUSL-1.1"
+}
