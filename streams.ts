@@ -1,17 +1,17 @@
 import type {
+  TSessionStreamOpenPayload,
+  TStreamResetCode,
   TSubscriptionProviderSlug,
   TTunnelForwardHeaders,
   TTunnelResponseHeaders,
+  TTunnelStreamOpenPayload,
   TTunnelSurface,
 } from "@openllmsh/protocol";
 import {
-  SessionId,
-  SubscriptionProviderSlug,
-  TunnelForwardHeaders,
-  TunnelResponseHeaders,
-  TunnelSurface,
+  parseStreamCtrlPayload,
+  parseStreamOpenPayload,
+  parseStreamResetPayload,
 } from "@openllmsh/protocol";
-import { Either, Schema as S } from "effect";
 import {
   decodeJsonPayload,
   encodeJsonPayload,
@@ -19,102 +19,16 @@ import {
 } from "./codec";
 import type { TMuxChannel, TMuxStream } from "./mux";
 
-// WS2: Move these schema declarations to @openllmsh/protocol/mux.ts unchanged.
-export const TunnelStreamOpenPayload = S.Struct({
-  kind: S.Literal("tunnel"),
-  method: S.Literal("POST"),
-  surface: TunnelSurface,
-  headers: S.optional(TunnelForwardHeaders),
-  consumer: S.optional(S.Literal("browser", "daemon")),
-});
-export type TTunnelStreamOpenPayload = S.Schema.Type<
-  typeof TunnelStreamOpenPayload
->;
-
-// WS2: Move these schema declarations to @openllmsh/protocol/mux.ts unchanged.
-export const SessionStreamOpenPayload = S.Struct({
-  kind: S.Literal("session"),
-  session_id: SessionId,
-  cli: SubscriptionProviderSlug,
-  cols: S.Number.pipe(S.between(1, 1024)),
-  rows: S.Number.pipe(S.between(1, 1024)),
-  mode: S.Literal("spawn", "attach", "continue"),
-  title: S.optional(S.String.pipe(S.maxLength(80))),
-});
-export type TSessionStreamOpenPayload = S.Schema.Type<
-  typeof SessionStreamOpenPayload
->;
-
-// WS2: Move these schema declarations to @openllmsh/protocol/mux.ts unchanged.
-export const StreamOpenPayload = S.Union(
-  TunnelStreamOpenPayload,
-  SessionStreamOpenPayload,
-);
-export type TStreamOpenPayload = S.Schema.Type<typeof StreamOpenPayload>;
-
-// WS2: Move these schema declarations to @openllmsh/protocol/mux.ts unchanged.
-export const StreamCtrlPayload = S.Union(
-  S.Struct({
-    t: S.Literal("open_ack"),
-    ok: S.Boolean,
-    live: S.optional(S.Boolean),
-    initial_credit: S.optional(S.Number),
-  }),
-  S.Struct({
-    t: S.Literal("res_head"),
-    status: S.Number,
-    res_headers: S.optional(TunnelResponseHeaders),
-  }),
-  S.Struct({
-    t: S.Literal("resize"),
-    cols: S.Number.pipe(S.between(1, 1024)),
-    rows: S.Number.pipe(S.between(1, 1024)),
-  }),
-  S.Struct({ t: S.Literal("replay_done") }),
-  S.Struct({ t: S.Literal("close"), intent: S.Literal("detach", "kill") }),
-);
-export type TStreamCtrlPayload = S.Schema.Type<typeof StreamCtrlPayload>;
-
-// WS2: Move these schema declarations to @openllmsh/protocol/mux.ts unchanged.
-export const StreamResetCode = S.Literal(
-  "tunnel_refused",
-  "tunnel_busy",
-  "invalid_tunnel",
-  "overloaded",
-  "pty_unsupported",
-  "cli_not_installed",
-  "session_not_found",
-  "session_busy",
-  "spawn_failed",
-  "dispatch_failed",
-  "timeout",
-  "protocol_error",
-  "peer_gone",
-);
-export type TStreamResetCode = S.Schema.Type<typeof StreamResetCode>;
-
-// WS2: Move these schema declarations to @openllmsh/protocol/mux.ts unchanged.
-export const StreamResetPayload = S.Struct({
-  code: StreamResetCode,
-  message: S.optional(S.String.pipe(S.maxLength(256))),
-});
-export type TStreamResetPayload = S.Schema.Type<typeof StreamResetPayload>;
-
-const decode = <T>(schema: S.Schema<T, T, never>, value: unknown): T | null => {
-  const result = S.decodeUnknownEither(schema)(value as T);
-  return Either.isRight(result) ? result.right : null;
-};
-
 const streamReset = (code: TStreamResetCode, message?: string): Uint8Array =>
   encodeJsonPayload({ code, ...(message === undefined ? {} : { message }) });
 
 const resetCode = (payload: Uint8Array): TStreamResetCode | null => {
-  const decoded = decode(StreamResetPayload, decodeJsonPayload(payload));
+  const decoded = parseStreamResetPayload(decodeJsonPayload(payload));
   return decoded?.code ?? null;
 };
 
 const unknownReset = (payload: Uint8Array): Error => {
-  const parsed = decode(StreamResetPayload, decodeJsonPayload(payload));
+  const parsed = parseStreamResetPayload(decodeJsonPayload(payload));
   return new Error(parsed?.message ?? parsed?.code ?? "stream reset");
 };
 
@@ -214,7 +128,7 @@ export const tunnelStream = (
       else resolve(result);
     };
     const offCtrl = stream.onCtrl((payload) => {
-      const ctrl = decode(StreamCtrlPayload, decodeJsonPayload(payload));
+      const ctrl = parseStreamCtrlPayload(decodeJsonPayload(payload));
       if (ctrl?.t !== "res_head") return;
       const headers = new Headers();
       if (ctrl.res_headers?.content_type !== undefined) {
@@ -289,8 +203,8 @@ export const sessionStream = (
       }
     });
     const offEnd = stream.onEnd(() => finish("done"));
-    const offCtrl = stream.onCtrl((payload) => {
-      const ctrl = decode(StreamCtrlPayload, decodeJsonPayload(payload));
+    const _offCtrl = stream.onCtrl((payload) => {
+      const ctrl = parseStreamCtrlPayload(decodeJsonPayload(payload));
       if (ctrl === null) return;
       if (ctrl.t === "replay_done") {
         if (replayDoneSeen) return;
@@ -334,6 +248,7 @@ export const sessionStream = (
     // Keep reset/end subscriptions live after open; only the open-ack listener is one-shot.
     void offReset;
     void offEnd;
+    void _offCtrl;
   });
 };
 
@@ -406,7 +321,7 @@ export const serveStream =
     options: TServeStreamsOptions,
   ): ((stream: TMuxStream, payload: Uint8Array) => void) =>
   (stream, payload) => {
-    const open = decode(StreamOpenPayload, decodeJsonPayload(payload));
+    const open = parseStreamOpenPayload(decodeJsonPayload(payload));
     if (open === null) {
       stream.reset(streamReset("protocol_error", "invalid OPEN payload"));
       return;
