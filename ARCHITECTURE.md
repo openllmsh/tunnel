@@ -9,8 +9,8 @@
 | Layer | Responsibility | Must not know |
 | --- | --- | --- |
 | `codec.ts` | Frozen binary frame layout and bounded JSON/window helpers | Stream semantics or payload schemas |
-| `mux.ts` | Per-stream credits, lifecycle, parity, backpressure | Tunnel/session payload shape or host I/O |
-| `streams.ts` | OPEN/CTRL/RESET schemas and fetch/PTY-shaped APIs | Relay routing and WebSocket mechanics |
+| `mux.ts` | Per-stream credits, lifecycle, parity, backpressure | Tunnel payload shape or host I/O |
+| `streams.ts` | OPEN/CTRL/RESET schemas and fetch-shaped tunnel stream APIs | Relay routing and WebSocket mechanics |
 
 ## Wire contract
 
