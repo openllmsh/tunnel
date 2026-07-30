@@ -51,6 +51,13 @@ export type TCreateChannelOptions = {
   readonly side: TChannelSide;
   readonly onStream?: (stream: TMuxStream, openPayload: Uint8Array) => void;
   readonly onClose?: (reason: TChannelCloseReason) => void;
+  /**
+   * Sender-side DATA payload cap (bytes). Defaults to {@link MAX_PAYLOAD_BYTES}.
+   * Used to stay under transport message-size limits (e.g. SCTP `maxMessageSize`
+   * on a WebRTC data channel). Decode still accepts up to {@link MAX_PAYLOAD_BYTES}.
+   * Clamped to `(0, MAX_PAYLOAD_BYTES]`.
+   */
+  readonly maxPayloadBytes?: number;
 };
 
 type TPendingWrite = {
@@ -117,6 +124,19 @@ export const createChannel = (options: TCreateChannelOptions): TMuxChannel => {
   if (options.onStream !== undefined) streamHandlers.add(options.onStream);
   let nextStreamId = options.side === "consumer" ? 1 : 2;
   let closed = false;
+  // Sender-only chunk size. Keep decode-side MAX_PAYLOAD_BYTES as the wire max.
+  const maxPayloadBytes = (() => {
+    const requested = options.maxPayloadBytes;
+    if (requested === undefined) return MAX_PAYLOAD_BYTES;
+    if (
+      !Number.isFinite(requested) ||
+      requested <= 0 ||
+      requested > MAX_PAYLOAD_BYTES
+    ) {
+      return MAX_PAYLOAD_BYTES;
+    }
+    return Math.floor(requested);
+  })();
 
   const send = (
     type: TFrameType,
@@ -179,7 +199,7 @@ export const createChannel = (options: TCreateChannelOptions): TMuxChannel => {
     ) {
       const pending = state.pending[0];
       const remaining = pending.bytes.byteLength - pending.offset;
-      const size = Math.min(remaining, state.sendCredit, MAX_PAYLOAD_BYTES);
+      const size = Math.min(remaining, state.sendCredit, maxPayloadBytes);
       if (size <= 0) break;
       const chunk = pending.bytes.subarray(
         pending.offset,

@@ -9,8 +9,10 @@
 | Layer | Responsibility | Must not know |
 | --- | --- | --- |
 | `codec.ts` | Frozen binary frame layout and bounded JSON/window helpers | Stream semantics or payload schemas |
-| `mux.ts` | Per-stream credits, lifecycle, parity, backpressure | Tunnel payload shape or host I/O |
+| `mux.ts` | Per-stream credits, lifecycle, parity, backpressure; optional sender-side `maxPayloadBytes` for SCTP-sized transports | Tunnel payload shape or host I/O |
 | `streams.ts` | OPEN/CTRL/RESET schemas and fetch-shaped tunnel stream APIs | Relay routing and WebSocket mechanics |
+| `rtc-duplex.ts` | ~20-line `TDuplex` over `RTCDataChannel` (DOM or werift) | Mux / payload schemas / auth |
+| `rtc-auth.ts` | Pure fingerprint-binding shapes + SDP helpers; hosts supply seal/open | Crypto implementations, signaling |
 
 ## Wire contract
 
