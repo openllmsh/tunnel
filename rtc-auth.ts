@@ -7,10 +7,9 @@
  *
  * Protocol (sealed-box challenge/response, no new crypto primitives):
  *   1. Browser mints nonce N (16B), reads its DTLS fingerprint Fb, generates
- *      an ephemeral X25519 keypair, and seals
- *        { v:1, n, fb, epk }
- *      to the daemon pubkey. That ciphertext is `fingerprint_proof` on
- *      `rtc_offer` (alongside the SDP offer).
+ *      an ephemeral X25519 keypair, and seals the offer inner to the daemon
+ *      pubkey. That ciphertext is `fingerprint_proof` on `rtc_offer`
+ *      (alongside the SDP offer).
  *   2. Daemon opens the seal with its private key, checks shape, then seals
  *        { v:1, n, fb, fd }
  *      to the browser's ephemeral pubkey. That ciphertext is
@@ -18,6 +17,15 @@
  *   3. Browser opens the answer seal, checks N matches (replay), Fb matches
  *      its local fingerprint, and Fd matches the fingerprint in the answer
  *      SDP — only then completes DTLS / marks the channel open.
+ *
+ * Offer-inner versions:
+ *   - v1 `{v:1, n, fb, epk}` — legacy, accepted only when the daemon is
+ *     un-provisioned for seed-gated device access.
+ *   - v2 `{v:2, n, fb, epk, grant}` — nested full device-grant envelope
+ *     (base64 from `encodeDeviceGrant`). Reuses standard grant validation
+ *     (ts window, nonce, key_id, cid, aud, sig); the sealed box already
+ *     binds fb/epk so the grant itself stays the plain device-grant shape
+ *     with `cid=channel_id` and `aud=daemon_pubkey`.
  *
  * This module is dependency-free: hosts supply seal/open via the existing
  * sealed-box implementations (`lib/daemon-seal.ts` / `packages/daemon/src/
@@ -27,6 +35,8 @@
  */
 
 export const RTC_AUTH_VERSION = 1 as const;
+/** Seed-gated offer inner: nests a full device-grant envelope. */
+export const RTC_AUTH_VERSION_2 = 2 as const;
 /** 16 random bytes, base64-encoded in the inner JSON. */
 export const RTC_AUTH_NONCE_BYTES = 16;
 /**
@@ -37,7 +47,7 @@ export const RTC_SAFE_MAX_PAYLOAD_BYTES = 16 * 1024;
 /** Header bytes reserved so a mux frame fits inside an SCTP message. */
 export const RTC_MUX_HEADER_OVERHEAD = 9;
 
-export type TRtcOfferInner = {
+export type TRtcOfferInnerV1 = {
   readonly v: typeof RTC_AUTH_VERSION;
   /** base64 of RTC_AUTH_NONCE_BYTES random bytes */
   readonly n: string;
@@ -46,6 +56,23 @@ export type TRtcOfferInner = {
   /** browser ephemeral X25519 public key (SPKI DER, base64) for the answer seal */
   readonly epk: string;
 };
+
+/**
+ * v2 offer inner. `grant` is the full `encodeDeviceGrant(...)` envelope
+ * string (base64 JSON). Nested rather than flat sig fields so the daemon
+ * reuses `checkDeviceGrant` (ts window, nonce LRU, key_id/cid/aud/sig)
+ * without a parallel validation path.
+ */
+export type TRtcOfferInnerV2 = {
+  readonly v: typeof RTC_AUTH_VERSION_2;
+  readonly n: string;
+  readonly fb: string;
+  readonly epk: string;
+  /** Full device-grant envelope (base64). */
+  readonly grant: string;
+};
+
+export type TRtcOfferInner = TRtcOfferInnerV1 | TRtcOfferInnerV2;
 
 export type TRtcAnswerInner = {
   readonly v: typeof RTC_AUTH_VERSION;
@@ -121,20 +148,29 @@ export const negotiateRtcPayloadCap = (
 const isNonEmptyString = (value: unknown): value is string =>
   typeof value === "string" && value.length > 0;
 
-export const encodeOfferInner = (inner: TRtcOfferInner): string =>
-  JSON.stringify({
+export const encodeOfferInner = (inner: TRtcOfferInner): string => {
+  if (inner.v === RTC_AUTH_VERSION_2) {
+    return JSON.stringify({
+      v: RTC_AUTH_VERSION_2,
+      n: inner.n,
+      fb: normalizeFingerprint(inner.fb),
+      epk: inner.epk,
+      grant: inner.grant,
+    });
+  }
+  return JSON.stringify({
     v: RTC_AUTH_VERSION,
     n: inner.n,
     fb: normalizeFingerprint(inner.fb),
     epk: inner.epk,
   });
+};
 
 export const decodeOfferInner = (json: string): TRtcOfferInner | null => {
   try {
     const parsed: unknown = JSON.parse(json);
     if (parsed === null || typeof parsed !== "object") return null;
     const o = parsed as Record<string, unknown>;
-    if (o.v !== RTC_AUTH_VERSION) return null;
     if (
       !isNonEmptyString(o.n) ||
       !isNonEmptyString(o.fb) ||
@@ -142,6 +178,17 @@ export const decodeOfferInner = (json: string): TRtcOfferInner | null => {
     ) {
       return null;
     }
+    if (o.v === RTC_AUTH_VERSION_2) {
+      if (!isNonEmptyString(o.grant)) return null;
+      return {
+        v: RTC_AUTH_VERSION_2,
+        n: o.n,
+        fb: normalizeFingerprint(o.fb),
+        epk: o.epk,
+        grant: o.grant,
+      };
+    }
+    if (o.v !== RTC_AUTH_VERSION) return null;
     return {
       v: RTC_AUTH_VERSION,
       n: o.n,
