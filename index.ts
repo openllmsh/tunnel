@@ -6,6 +6,7 @@
  * `rtc-auth.ts` (hosts supply seal/open).
  */
 export * from "./codec";
+export * from "./device-grant";
 export * from "./mux";
 export * from "./rtc-auth";
 export * from "./rtc-duplex";
