@@ -17,41 +17,56 @@ import {
 } from "./codec";
 import type { TMuxChannel, TMuxStream } from "./mux";
 
+/** Default wait for the serving end's `res_head` CTRL (matches legacy tunnel). */
+export const TUNNEL_RESPONSE_HEAD_TIMEOUT_MS = 120_000;
+
 const streamReset = (code: TStreamResetCode, message?: string): Uint8Array =>
   encodeJsonPayload({ code, ...(message === undefined ? {} : { message }) });
-
-const resetCode = (payload: Uint8Array): TStreamResetCode | null => {
-  const decoded = parseStreamResetPayload(decodeJsonPayload(payload));
-  return decoded?.code ?? null;
-};
 
 const unknownReset = (payload: Uint8Array): Error => {
   const parsed = parseStreamResetPayload(decodeJsonPayload(payload));
   return new Error(parsed?.message ?? parsed?.code ?? "stream reset");
 };
 
+/**
+ * Mirror a mux stream as a ReadableStream. Cancelling the body (e.g. a
+ * consumer dropping a Response body) RESETs the remote stream so the peer
+ * can abort its work.
+ */
 const bodyFromStream = (
   stream: TMuxStream,
   onReset?: () => void,
-): ReadableStream<Uint8Array> =>
-  new ReadableStream<Uint8Array>({
+): ReadableStream<Uint8Array> => {
+  let offData: (() => void) | undefined;
+  let offEnd: (() => void) | undefined;
+  let offReset: (() => void) | undefined;
+  const cleanup = (): void => {
+    offData?.();
+    offEnd?.();
+    offReset?.();
+    offData = undefined;
+    offEnd = undefined;
+    offReset = undefined;
+  };
+  return new ReadableStream<Uint8Array>({
     start(controller) {
-      const offData = stream.onData((bytes) => controller.enqueue(bytes));
-      const offEnd = stream.onEnd(() => {
-        offData();
-        offEnd();
-        offReset();
+      offData = stream.onData((bytes) => controller.enqueue(bytes));
+      offEnd = stream.onEnd(() => {
+        cleanup();
         controller.close();
       });
-      const offReset = stream.onReset((payload) => {
-        offData();
-        offEnd();
-        offReset();
+      offReset = stream.onReset((payload) => {
+        cleanup();
         onReset?.();
         controller.error(unknownReset(payload));
       });
     },
+    cancel() {
+      cleanup();
+      stream.reset(streamReset("peer_gone", "consumer cancelled"));
+    },
   });
+};
 
 const pumpBody = async (
   stream: TMuxStream,
@@ -63,8 +78,28 @@ const pumpBody = async (
     return;
   }
   if (body instanceof Uint8Array) {
-    if (body.byteLength > 0) await stream.write(body);
-    stream.end();
+    if (signal?.aborted) {
+      stream.reset(streamReset("peer_gone", "aborted"));
+      return;
+    }
+    // Brief write window — still honor abort so a pre-end cancel reaches the peer.
+    const onAbort = (): void => {
+      stream.reset(streamReset("peer_gone", "aborted"));
+    };
+    signal?.addEventListener("abort", onAbort, { once: true });
+    try {
+      if (body.byteLength > 0) await stream.write(body);
+      if (!signal?.aborted) stream.end();
+    } catch (error) {
+      stream.reset(
+        streamReset(
+          "peer_gone",
+          error instanceof Error ? error.message : undefined,
+        ),
+      );
+    } finally {
+      signal?.removeEventListener("abort", onAbort);
+    }
     return;
   }
   const reader = body.getReader();
@@ -73,6 +108,11 @@ const pumpBody = async (
     stream.reset(streamReset("peer_gone", "aborted"));
     void reader.cancel().catch(() => {});
   };
+  if (signal?.aborted) {
+    onAbort();
+    reader.releaseLock();
+    return;
+  }
   signal?.addEventListener("abort", onAbort, { once: true });
   try {
     for (;;) {
@@ -100,6 +140,12 @@ export type TTunnelStreamOptions = {
   readonly headers?: TTunnelForwardHeaders;
   readonly body: ReadableStream<Uint8Array> | Uint8Array | null;
   readonly signal?: AbortSignal;
+  /**
+   * Max wait for the serving end's `res_head` CTRL before rejecting with
+   * `"tunnel response timed out"` and RESETing the stream. Defaults to
+   * {@link TUNNEL_RESPONSE_HEAD_TIMEOUT_MS} (legacy tunnel parity).
+   */
+  readonly headTimeoutMs?: number;
 };
 
 export type TTunnelStreamResult = {
@@ -121,19 +167,38 @@ export const tunnelStream = (
       ...(options.headers === undefined ? {} : { headers: options.headers }),
     }),
   );
-  void pumpBody(stream, options.body, options.signal);
 
   return new Promise<TTunnelStreamResult>((resolve, reject) => {
     let settled = false;
+    let offCtrl = (): void => {};
+    let offReset = (): void => {};
+    const headTimeoutMs =
+      options.headTimeoutMs ?? TUNNEL_RESPONSE_HEAD_TIMEOUT_MS;
+
     const settle = (result: TTunnelStreamResult | Error): void => {
       if (settled) return;
       settled = true;
+      clearTimeout(headTimer);
+      options.signal?.removeEventListener("abort", onAbort);
       offCtrl();
       offReset();
       if (result instanceof Error) reject(result);
       else resolve(result);
     };
-    const offCtrl = stream.onCtrl((payload) => {
+
+    // Settle FIRST so the local onReset from stream.reset() cannot
+    // overwrite AbortError / timeout with unknownReset(payload).
+    const onAbort = (): void => {
+      settle(new DOMException("Aborted", "AbortError"));
+      stream.reset(streamReset("peer_gone", "aborted"));
+    };
+
+    const headTimer = setTimeout(() => {
+      settle(new Error("tunnel response timed out"));
+      stream.reset(streamReset("timeout", "tunnel response timed out"));
+    }, headTimeoutMs);
+
+    offCtrl = stream.onCtrl((payload) => {
       const ctrl = parseStreamCtrlPayload(decodeJsonPayload(payload));
       if (ctrl?.t !== "res_head") return;
       const headers = new Headers();
@@ -142,7 +207,16 @@ export const tunnelStream = (
       }
       settle({ status: ctrl.status, headers, body: bodyFromStream(stream) });
     });
-    const offReset = stream.onReset((payload) => settle(unknownReset(payload)));
+    offReset = stream.onReset((payload) => settle(unknownReset(payload)));
+
+    // Arm abort before pumping the body so AbortError wins the settle race
+    // against pumpBody's own reset → onReset(unknownReset) path.
+    if (options.signal?.aborted) {
+      onAbort();
+      return;
+    }
+    options.signal?.addEventListener("abort", onAbort, { once: true });
+    void pumpBody(stream, options.body, options.signal);
   });
 };
 
