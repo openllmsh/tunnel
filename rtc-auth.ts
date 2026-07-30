@@ -97,18 +97,23 @@ export const maxMessageSizeFromSdp = (sdp: string): number | null => {
  * Mux DATA payload cap for an RTC channel: min(SDP max-message-size − header,
  * MAX_PAYLOAD_BYTES) with a safe floor when SDP omits the attribute.
  * `wireMax` is typically {@link MAX_PAYLOAD_BYTES} from the codec.
+ *
+ * Returns `null` when the advertised SCTP limit cannot fit even a 1-byte DATA
+ * frame (limit ≤ header overhead) — callers must abort session setup rather
+ * than mount a mux that can never drain.
  */
 export const negotiateRtcPayloadCap = (
   sdpMaxMessageSize: number | null,
   wireMax: number,
-): number => {
+): number | null => {
   if (sdpMaxMessageSize === null) {
     return Math.min(RTC_SAFE_MAX_PAYLOAD_BYTES, wireMax);
   }
   const usable = sdpMaxMessageSize - RTC_MUX_HEADER_OVERHEAD;
+  if (usable < 1) return null;
   if (usable < RTC_SAFE_MAX_PAYLOAD_BYTES) {
-    // Pathological SDP — still try the floor so small frames work.
-    return Math.max(1, Math.min(usable, wireMax));
+    // Pathological-but-usable SDP — still try whatever fits.
+    return Math.min(usable, wireMax);
   }
   return Math.min(usable, wireMax);
 };

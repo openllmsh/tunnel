@@ -125,17 +125,15 @@ export const createChannel = (options: TCreateChannelOptions): TMuxChannel => {
   let nextStreamId = options.side === "consumer" ? 1 : 2;
   let closed = false;
   // Sender-only chunk size. Keep decode-side MAX_PAYLOAD_BYTES as the wire max.
+  // Floor before validating so fractional values like 0.9 don't become 0 and
+  // permanently stall drain() (Math.min(..., 0) never advances pending writes).
   const maxPayloadBytes = (() => {
     const requested = options.maxPayloadBytes;
     if (requested === undefined) return MAX_PAYLOAD_BYTES;
-    if (
-      !Number.isFinite(requested) ||
-      requested <= 0 ||
-      requested > MAX_PAYLOAD_BYTES
-    ) {
-      return MAX_PAYLOAD_BYTES;
-    }
-    return Math.floor(requested);
+    if (!Number.isFinite(requested)) return MAX_PAYLOAD_BYTES;
+    const floored = Math.floor(requested);
+    if (floored < 1 || floored > MAX_PAYLOAD_BYTES) return MAX_PAYLOAD_BYTES;
+    return floored;
   })();
 
   const send = (
