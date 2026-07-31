@@ -158,17 +158,16 @@ export type TTunnelStreamResult = {
 export const tunnelStream = (
   channel: TMuxChannel,
   options: TTunnelStreamOptions,
-): Promise<TTunnelStreamResult> => {
-  const stream = channel.openStream(
-    encodeJsonPayload({
-      kind: "tunnel",
-      method: "POST",
-      surface: options.surface,
-      ...(options.headers === undefined ? {} : { headers: options.headers }),
-    }),
-  );
-
-  return new Promise<TTunnelStreamResult>((resolve, reject) => {
+): Promise<TTunnelStreamResult> =>
+  new Promise<TTunnelStreamResult>((resolve, reject) => {
+    const stream = channel.openStream(
+      encodeJsonPayload({
+        kind: "tunnel",
+        method: "POST",
+        surface: options.surface,
+        ...(options.headers === undefined ? {} : { headers: options.headers }),
+      }),
+    );
     let settled = false;
     let offCtrl = (): void => {};
     let offReset = (): void => {};
@@ -218,7 +217,6 @@ export const tunnelStream = (
     options.signal?.addEventListener("abort", onAbort, { once: true });
     void pumpBody(stream, options.body, options.signal);
   });
-};
 
 export type TServeTunnelResponse = {
   readonly status: number;

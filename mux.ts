@@ -190,6 +190,8 @@ export const createChannel = (options: TCreateChannelOptions): TMuxChannel => {
       return;
     state.localEnded = true;
     send(FRAME_TYPE.end, state.id, new Uint8Array());
+    if (state.remoteEnded && state.pending.length === 0)
+      streams.delete(state.id);
   };
 
   const drain = (state: TStreamState): void => {
@@ -239,9 +241,8 @@ export const createChannel = (options: TCreateChannelOptions): TMuxChannel => {
     const stream: TMuxStream = {
       id: state.id,
       write: (bytes) => {
-        if (state.localEnded || state.endRequested) {
-          throw new Error("write after end");
-        }
+        if (state.localEnded || state.endRequested)
+          return Promise.reject(new Error("write after end"));
         if (state.reset || closed)
           return Promise.reject(new Error("stream is closed"));
         if (bytes.byteLength === 0) return Promise.resolve();
@@ -308,11 +309,7 @@ export const createChannel = (options: TCreateChannelOptions): TMuxChannel => {
       const state = makeState(frame.streamId);
       const stream = makeStream(state);
       streams.set(frame.streamId, state);
-      try {
-        emit(streamHandlers, (handler) => handler(stream, frame.payload));
-      } catch {
-        stream.reset();
-      }
+      emit(streamHandlers, (handler) => handler(stream, frame.payload));
       return;
     }
 
@@ -349,6 +346,8 @@ export const createChannel = (options: TCreateChannelOptions): TMuxChannel => {
         }
         state.remoteEnded = true;
         emit(state.endHandlers, (handler) => handler());
+        if (state.localEnded && state.pending.length === 0)
+          streams.delete(state.id);
         return;
       case FRAME_TYPE.reset:
         localReset(state, frame.payload);

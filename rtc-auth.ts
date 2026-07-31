@@ -139,10 +139,6 @@ export const negotiateRtcPayloadCap = (
   }
   const usable = sdpMaxMessageSize - RTC_MUX_HEADER_OVERHEAD;
   if (usable < 1) return null;
-  if (usable < RTC_SAFE_MAX_PAYLOAD_BYTES) {
-    // Pathological-but-usable SDP — still try whatever fits.
-    return Math.min(usable, wireMax);
-  }
   return Math.min(usable, wireMax);
 };
 
