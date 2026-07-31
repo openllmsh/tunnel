@@ -73,10 +73,22 @@ const isNonEmptyString = (value: unknown): value is string => {
   return typeof value === "string" && value.length > 0;
 };
 
+/** True when `n` is base64 of exactly {@link DEVICE_GRANT_NONCE_BYTES} bytes. */
+const isValidNonce = (value: unknown): value is string => {
+  if (!isNonEmptyString(value)) return false;
+  try {
+    const bin = atob(value);
+    return bin.length === DEVICE_GRANT_NONCE_BYTES;
+  } catch {
+    return false;
+  }
+};
+
 /**
  * Strict decode: returns null on any shape mismatch. `aud` may be the
  * empty string (legacy tunnel path); every other string field must be
- * non-empty, `v` must be exactly 1 and `ts` a finite positive number.
+ * non-empty, `v` must be exactly 1, `n` base64 of
+ * {@link DEVICE_GRANT_NONCE_BYTES} bytes, and `ts` a finite positive integer.
  */
 export const decodeDeviceGrant = (b64: string): TDeviceGrantEnvelope | null => {
   let parsed: unknown;
@@ -95,8 +107,13 @@ export const decodeDeviceGrant = (b64: string): TDeviceGrantEnvelope | null => {
   }
   const o = parsed as Record<string, unknown>;
   if (o.v !== DEVICE_GRANT_VERSION) return null;
-  if (!isNonEmptyString(o.n)) return null;
-  if (typeof o.ts !== "number" || !Number.isFinite(o.ts) || o.ts <= 0) {
+  if (!isValidNonce(o.n)) return null;
+  if (
+    typeof o.ts !== "number" ||
+    !Number.isFinite(o.ts) ||
+    !Number.isInteger(o.ts) ||
+    o.ts <= 0
+  ) {
     return null;
   }
   if (!isNonEmptyString(o.key_id)) return null;
