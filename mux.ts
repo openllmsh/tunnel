@@ -55,7 +55,8 @@ export type TCreateChannelOptions = {
    * Sender-side DATA payload cap (bytes). Defaults to {@link MAX_PAYLOAD_BYTES}.
    * Used to stay under transport message-size limits (e.g. SCTP `maxMessageSize`
    * on a WebRTC data channel). Decode still accepts up to {@link MAX_PAYLOAD_BYTES}.
-   * Clamped to `(0, MAX_PAYLOAD_BYTES]`.
+   * Finite values below 1 clamp to 1; undefined / non-finite / oversized fall
+   * back to {@link MAX_PAYLOAD_BYTES}.
    */
   readonly maxPayloadBytes?: number;
 };
@@ -132,7 +133,10 @@ export const createChannel = (options: TCreateChannelOptions): TMuxChannel => {
     if (requested === undefined) return MAX_PAYLOAD_BYTES;
     if (!Number.isFinite(requested)) return MAX_PAYLOAD_BYTES;
     const floored = Math.floor(requested);
-    if (floored < 1 || floored > MAX_PAYLOAD_BYTES) return MAX_PAYLOAD_BYTES;
+    // Finite values below 1 clamp to 1 so drain() still advances; only
+    // undefined / non-finite / oversized fall back to MAX_PAYLOAD_BYTES.
+    if (floored > MAX_PAYLOAD_BYTES) return MAX_PAYLOAD_BYTES;
+    if (floored < 1) return 1;
     return floored;
   })();
 
