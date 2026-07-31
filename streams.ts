@@ -232,6 +232,8 @@ export type TSessionStreamOptions = {
   readonly rows: number;
   readonly mode: "spawn" | "attach" | "continue";
   readonly title?: string;
+  /** Maps to `openllm -d <client>` for CLIs that support skip-approvals. */
+  readonly dangerous?: boolean;
 };
 
 export type TSessionCloseResult = TStreamResetCode | "done" | "detach";
@@ -264,6 +266,7 @@ export const sessionStream = (
       rows: options.rows,
       mode: options.mode,
       ...(options.title === undefined ? {} : { title: options.title }),
+      ...(options.dangerous === true ? { dangerous: true } : {}),
     }),
   );
   const replayHandlers = new Set<() => void>();
