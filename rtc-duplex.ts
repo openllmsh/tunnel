@@ -99,7 +99,15 @@ export const rtcDuplex = (dc: TRtcDataChannelLike): TDuplex => {
 
   return {
     send: (bytes) => {
-      if (closed || dc.readyState !== "open") return;
+      if (closed) return;
+      if (dc.readyState !== "open") {
+        // Non-open (closing/closed/connecting) is a transport failure: mux
+        // resolves write() once duplex.send returns, so silent drop would
+        // look like success while bytes vanish and flow-control credit is
+        // consumed. Surface peer-gone so the mux tears streams down.
+        onPeerGone();
+        return;
+      }
       try {
         // Pass a copy-friendly view; WebRTC/werift copy into the SCTP stack.
         dc.send(bytes);
