@@ -1,5 +1,7 @@
 import type {
+  TSessionStreamOpenPayload,
   TStreamResetCode,
+  TSubscriptionProviderSlug,
   TTunnelForwardHeaders,
   TTunnelResponseHeaders,
   TTunnelStreamOpenPayload,
@@ -22,6 +24,11 @@ export const TUNNEL_RESPONSE_HEAD_TIMEOUT_MS = 120_000;
 
 const streamReset = (code: TStreamResetCode, message?: string): Uint8Array =>
   encodeJsonPayload({ code, ...(message === undefined ? {} : { message }) });
+
+const resetCode = (payload: Uint8Array): TStreamResetCode | null => {
+  const decoded = parseStreamResetPayload(decodeJsonPayload(payload));
+  return decoded?.code ?? null;
+};
 
 const unknownReset = (payload: Uint8Array): Error => {
   const parsed = parseStreamResetPayload(decodeJsonPayload(payload));
@@ -218,6 +225,136 @@ export const tunnelStream = (
     void pumpBody(stream, options.body, options.signal);
   });
 
+export type TSessionStreamOptions = {
+  readonly sessionId: string;
+  readonly cli: TSubscriptionProviderSlug;
+  readonly cols: number;
+  readonly rows: number;
+  readonly mode: "spawn" | "attach" | "continue";
+  readonly title?: string;
+};
+
+export type TSessionCloseResult = TStreamResetCode | "done" | "detach";
+export type TSessionStreamResult = {
+  readonly live: boolean;
+  readonly stdout: ReadableStream<Uint8Array>;
+  readonly write: (bytes: Uint8Array) => Promise<void>;
+  readonly resize: (cols: number, rows: number) => void;
+  readonly detach: () => void;
+  readonly kill: () => void;
+  readonly onReplayDone: (callback: () => void) => () => void;
+  readonly closed: Promise<TSessionCloseResult>;
+};
+
+/**
+ * Open a long-lived PTY session stream over a mux channel. Resolves once the
+ * serving daemon acks (`open_ack`); rejects with the nack code/message when
+ * the open is refused (`cli_not_installed`, `session_busy`, …).
+ */
+export const sessionStream = (
+  channel: TMuxChannel,
+  options: TSessionStreamOptions,
+): Promise<TSessionStreamResult> => {
+  const stream = channel.openStream(
+    encodeJsonPayload({
+      kind: "session",
+      session_id: options.sessionId,
+      cli: options.cli,
+      cols: options.cols,
+      rows: options.rows,
+      mode: options.mode,
+      ...(options.title === undefined ? {} : { title: options.title }),
+    }),
+  );
+  const replayHandlers = new Set<() => void>();
+  // replay_done can arrive in the same delivery batch as open_ack — before the
+  // caller has had a microtask to register a listener. Latch it so a late
+  // registration still observes the marker exactly once.
+  let replayDoneSeen = false;
+  let resolveClosed: (result: TSessionCloseResult) => void = () => {};
+  const closed = new Promise<TSessionCloseResult>((resolve) => {
+    resolveClosed = resolve;
+  });
+  let closedResult = false;
+  const finish = (result: TSessionCloseResult): void => {
+    if (closedResult) return;
+    closedResult = true;
+    resolveClosed(result);
+  };
+
+  return new Promise<TSessionStreamResult>((resolve, reject) => {
+    let settled = false;
+    const offReset = stream.onReset((payload) => {
+      const code = resetCode(payload) ?? "protocol_error";
+      finish(code);
+      if (!settled) {
+        settled = true;
+        reject(unknownReset(payload));
+      }
+    });
+    const offEnd = stream.onEnd(() => finish("done"));
+    const _offCtrl = stream.onCtrl((payload) => {
+      const ctrl = parseStreamCtrlPayload(decodeJsonPayload(payload));
+      if (ctrl === null) return;
+      if (ctrl.t === "replay_done") {
+        if (replayDoneSeen) return;
+        replayDoneSeen = true;
+        for (const handler of replayHandlers) handler();
+        return;
+      }
+      if (ctrl.t !== "open_ack" || settled) return;
+      if (!ctrl.ok) {
+        settled = true;
+        // Prefer the nack code/message when present so the UI can show
+        // cli_not_installed / session_busy / overloaded / etc. instead of a
+        // generic "session refused".
+        const detail =
+          (typeof ctrl.message === "string" && ctrl.message.length > 0
+            ? ctrl.message
+            : undefined) ??
+          (typeof ctrl.error === "string" && ctrl.error.length > 0
+            ? ctrl.error
+            : undefined) ??
+          "session refused";
+        stream.reset(streamReset("protocol_error", detail));
+        reject(new Error(detail));
+        return;
+      }
+      settled = true;
+      resolve({
+        live: ctrl.live ?? false,
+        stdout: bodyFromStream(stream),
+        write: stream.write,
+        resize: (cols, rows) =>
+          stream.sendCtrl(encodeJsonPayload({ t: "resize", cols, rows })),
+        detach: () => {
+          stream.end();
+          finish("detach");
+        },
+        kill: () => {
+          stream.sendCtrl(encodeJsonPayload({ t: "close", intent: "kill" }));
+          stream.end();
+        },
+        onReplayDone: (callback) => {
+          if (replayDoneSeen) {
+            callback();
+            return () => {};
+          }
+          replayHandlers.add(callback);
+          return () => {
+            replayHandlers.delete(callback);
+          };
+        },
+        closed,
+      });
+    });
+    // Keep reset/end subscriptions live after open; only the open-ack listener is one-shot.
+    void offReset;
+    void offEnd;
+    void _offCtrl;
+  });
+};
+
 export type TServeTunnelResponse = {
   readonly status: number;
   readonly headers?: TTunnelResponseHeaders;
@@ -232,8 +369,14 @@ export type TServeTunnel = (
   signal: AbortSignal,
 ) => Promise<TServeTunnelResponse>;
 
+export type TServeSession = (
+  stream: TMuxStream,
+  open: TSessionStreamOpenPayload,
+) => void | Promise<void>;
+
 export type TServeStreamsOptions = {
   readonly tunnel: TServeTunnel;
+  readonly session?: TServeSession;
   /** Reject a valid tunnel OPEN before dispatch, using host-specific wire semantics. */
   readonly admitTunnel?: (
     open: TTunnelStreamOpenPayload,
@@ -294,6 +437,12 @@ const sendResponse = async (
   }
 };
 
+/** Bind application-level OPEN payloads to a serving mux channel. */
+export const serveStreams = (
+  channel: TMuxChannel,
+  options: TServeStreamsOptions,
+): (() => void) => channel.onStream(serveStream(options));
+
 /** Application handler for `createChannel({ onStream })`, exported for hosts. */
 export const serveStream =
   (
@@ -308,6 +457,16 @@ export const serveStream =
           "invalid OPEN payload",
         ),
       );
+      return;
+    }
+    if (open.kind === "session") {
+      if (options.session === undefined) {
+        stream.reset(streamReset("pty_unsupported"));
+        return;
+      }
+      void Promise.resolve(options.session(stream, open)).catch(() => {
+        stream.reset(streamReset("dispatch_failed"));
+      });
       return;
     }
     const rejected = options.admitTunnel?.(open);
