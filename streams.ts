@@ -317,6 +317,8 @@ export const sessionStream = (
             : undefined) ??
           "session refused";
         stream.reset(streamReset("protocol_error", detail));
+        // Settle `closed` so callers waiting on it don't hang after a nack.
+        finish("protocol_error");
         reject(new Error(detail));
         return;
       }
@@ -464,7 +466,10 @@ export const serveStream =
         stream.reset(streamReset("pty_unsupported"));
         return;
       }
-      void Promise.resolve(options.session(stream, open)).catch(() => {
+      // Defer invoke so both sync throws and rejected promises hit the same
+      // catch (Promise.resolve(fn()) does not catch sync throws from fn).
+      const dispatch = options.session;
+      void (async () => dispatch(stream, open))().catch(() => {
         stream.reset(streamReset("dispatch_failed"));
       });
       return;
