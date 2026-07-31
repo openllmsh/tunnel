@@ -234,6 +234,11 @@ export type TSessionStreamOptions = {
   readonly title?: string;
   /** Maps to `openllm -d <client>` for CLIs that support skip-approvals. */
   readonly dangerous?: boolean;
+  /**
+   * Abort cancels an in-flight open (RESET + reject) so callers can time out
+   * without leaving a dangling mux stream that later races a retry.
+   */
+  readonly signal?: AbortSignal;
 };
 
 export type TSessionCloseResult = TStreamResetCode | "done" | "detach";
@@ -287,13 +292,23 @@ export const sessionStream = (
 
   return new Promise<TSessionStreamResult>((resolve, reject) => {
     let settled = false;
+    const settleReject = (error: Error): void => {
+      if (settled) return;
+      settled = true;
+      options.signal?.removeEventListener("abort", onAbort);
+      reject(error);
+    };
+    const onAbort = (): void => {
+      // Pre-ack abort: RESET so the daemon detaches and a retry can re-open
+      // the same session id without session_busy from a dangling stream.
+      stream.reset(streamReset("timeout", "session open timed out"));
+      finish("timeout");
+      settleReject(new Error("session open timed out"));
+    };
     const offReset = stream.onReset((payload) => {
       const code = resetCode(payload) ?? "protocol_error";
       finish(code);
-      if (!settled) {
-        settled = true;
-        reject(unknownReset(payload));
-      }
+      settleReject(unknownReset(payload));
     });
     const offEnd = stream.onEnd(() => finish("done"));
     const _offCtrl = stream.onCtrl((payload) => {
@@ -307,7 +322,6 @@ export const sessionStream = (
       }
       if (ctrl.t !== "open_ack" || settled) return;
       if (!ctrl.ok) {
-        settled = true;
         // Prefer the nack code/message when present so the UI can show
         // cli_not_installed / session_busy / overloaded / etc. instead of a
         // generic "session refused".
@@ -322,10 +336,11 @@ export const sessionStream = (
         stream.reset(streamReset("protocol_error", detail));
         // Settle `closed` so callers waiting on it don't hang after a nack.
         finish("protocol_error");
-        reject(new Error(detail));
+        settleReject(new Error(detail));
         return;
       }
       settled = true;
+      options.signal?.removeEventListener("abort", onAbort);
       resolve({
         live: ctrl.live ?? false,
         stdout: bodyFromStream(stream),
@@ -353,6 +368,11 @@ export const sessionStream = (
         closed,
       });
     });
+    if (options.signal?.aborted) {
+      onAbort();
+    } else {
+      options.signal?.addEventListener("abort", onAbort, { once: true });
+    }
     // Keep reset/end subscriptions live after open; only the open-ack listener is one-shot.
     void offReset;
     void offEnd;
