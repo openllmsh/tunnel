@@ -46,8 +46,11 @@ application payloads and stream state stay endpoint-private.
   browser vault; verified by the daemon). Capability negotiation uses
   `seedgate1` from `@openllmsh/protocol`.
 - `rtc-auth.ts` / `rtc-duplex.ts` — WebRTC fingerprint-bound offer/answer shapes
-  and a thin data-channel duplex. Hosts (browser store + daemon `rtc-host`) own
-  signaling and crypto.
+  and a thin data-channel duplex. Hosts own signaling and crypto: the browser
+  and consuming fleet daemon are offerers, while the serving daemon's `rtc-host`
+  is the answerer. This is the one direct-path stack for browser↔daemon and
+  daemon↔daemon traffic; relay binary mux and JSON splice remain the fallback
+  ladder.
 
 **Still future (not present in this package):**
 
