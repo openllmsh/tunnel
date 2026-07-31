@@ -27,12 +27,13 @@
  *     binds fb/epk so the grant itself stays the plain device-grant shape
  *     with `cid=channel_id` and `aud=daemon_pubkey`.
  *
- * This module is dependency-free: hosts supply seal/open via the existing
- * sealed-box implementations (`lib/daemon-seal.ts` / `packages/daemon/src/
- * keypair.ts`). Fingerprint strings are normalized (lowercase, strip
- * separators) so SDP `a=fingerprint:sha-256 AA:BB:…` and bare hex compare
- * equal.
+ * Hosts supply seal/open via the existing sealed-box implementations
+ * (`lib/daemon-seal.ts` / `packages/daemon/src/keypair.ts`). Fingerprint
+ * strings are normalized (lowercase, strip separators) so SDP
+ * `a=fingerprint:sha-256 AA:BB:…` and bare hex compare equal.
  */
+
+import { FRAME_HEADER_BYTES } from "./codec";
 
 export const RTC_AUTH_VERSION = 1 as const;
 /** Seed-gated offer inner: nests a full device-grant envelope. */
@@ -45,7 +46,7 @@ export const RTC_AUTH_NONCE_BYTES = 16;
  */
 export const RTC_SAFE_MAX_PAYLOAD_BYTES = 16 * 1024;
 /** Header bytes reserved so a mux frame fits inside an SCTP message. */
-export const RTC_MUX_HEADER_OVERHEAD = 9;
+export const RTC_MUX_HEADER_OVERHEAD = FRAME_HEADER_BYTES;
 
 export type TRtcOfferInnerV1 = {
   readonly v: typeof RTC_AUTH_VERSION;
