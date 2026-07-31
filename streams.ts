@@ -296,12 +296,6 @@ const sendResponse = async (
   }
 };
 
-/** Bind application-level OPEN payloads to a serving mux channel. */
-export const serveStreams = (
-  channel: TMuxChannel,
-  options: TServeStreamsOptions,
-): (() => void) => channel.onStream(serveStream(options));
-
 /** Application handler for `createChannel({ onStream })`, exported for hosts. */
 export const serveStream =
   (

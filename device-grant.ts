@@ -1,21 +1,18 @@
 /**
  * Canonical device-grant wire format shared by the browser (which
  * SIGNS grants with the vault-derived device-access key) and the
- * daemon (which VERIFIES them). Dependency-free: bytes + JSON only —
- * no crypto lives here.
+ * daemon (which VERIFIES them). Bytes + JSON only — no crypto lives
+ * here. Wire size cap is owned by protocol and re-exported.
  */
+
+import { DEVICE_GRANT_B64_MAX } from "@openllmsh/protocol";
+
+export { DEVICE_GRANT_B64_MAX };
 
 export const DEVICE_GRANT_LABEL = "openllm-device-grant-v1";
 export const DEVICE_GRANT_VERSION = 1 as const;
 export const DEVICE_GRANT_TS_WINDOW_MS = 120_000;
 export const DEVICE_GRANT_NONCE_BYTES = 16;
-/**
- * Soft upper bound on the base64 envelope string. Matches
- * `DEVICE_GRANT_B64_MAX` in `@openllmsh/protocol` relay frames so codec and
- * Schema reject the same oversized grants. Kept as a literal here because
- * tunnel is dep-free of protocol.
- */
-export const DEVICE_GRANT_B64_MAX = 4 * 1024;
 
 export type TDeviceGrantFields = {
   readonly v: 1;
