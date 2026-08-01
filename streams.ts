@@ -362,6 +362,10 @@ export const sessionStream = (
         kill: () => {
           stream.sendCtrl(encodeJsonPayload({ t: "close", intent: "kill" }));
           stream.end();
+          // Settle `closed` locally so a caller awaiting it never hangs if the
+          // daemon never sends a terminal END. `finish` is idempotent, so the
+          // daemon's own END (→ "done") later is harmless.
+          finish("done");
         },
         onReplayDone: (callback) => {
           if (replayDoneSeen) {
