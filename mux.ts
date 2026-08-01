@@ -178,16 +178,22 @@ export const createChannel = (options: TCreateChannelOptions): TMuxChannel => {
     options.duplex.send(encodeFrame({ type, streamId, payload }));
   };
 
-  const localReset = (state: TStreamState, payload?: Uint8Array): void => {
-    if (state.reset) return;
-    state.reset = true;
+  const retireStreamState = (state: TStreamState): void => {
+    const current = streams.get(state.id);
+    if (current !== state) return;
+    streams.delete(state.id);
     if (state.openedByPeer) {
       peerOpenStreams -= 1;
     }
+  };
+
+  const localReset = (state: TStreamState, payload?: Uint8Array): void => {
+    if (state.reset) return;
+    state.reset = true;
     for (const pending of state.pending.splice(0)) {
       pending.reject(resetError(payload));
     }
-    streams.delete(state.id);
+    retireStreamState(state);
     emit(state.resetHandlers, (handler) =>
       handler(payload ?? new Uint8Array()),
     );
@@ -211,6 +217,11 @@ export const createChannel = (options: TCreateChannelOptions): TMuxChannel => {
 
   const protocolError = (): void => close("protocol_error");
 
+  const tryRetireStreamState = (state: TStreamState): void => {
+    if (!state.localEnded || !state.remoteEnded || state.pending.length > 0) return;
+    retireStreamState(state);
+  };
+
   const sendEndIfReady = (state: TStreamState): void => {
     if (
       !state.endRequested ||
@@ -222,12 +233,7 @@ export const createChannel = (options: TCreateChannelOptions): TMuxChannel => {
       return;
     state.localEnded = true;
     send(FRAME_TYPE.end, state.id, new Uint8Array());
-    if (state.remoteEnded && state.pending.length === 0) {
-      streams.delete(state.id);
-      if (state.openedByPeer) {
-        peerOpenStreams -= 1;
-      }
-    }
+    tryRetireStreamState(state);
   };
 
   const drain = (state: TStreamState): void => {
@@ -413,10 +419,7 @@ export const createChannel = (options: TCreateChannelOptions): TMuxChannel => {
         state.remoteEnded = true;
         emit(state.endHandlers, (handler) => handler());
         if (state.localEnded && state.pending.length === 0) {
-          streams.delete(state.id);
-          if (state.openedByPeer) {
-            peerOpenStreams -= 1;
-          }
+          retireStreamState(state);
         }
         return;
       case FRAME_TYPE.reset:
