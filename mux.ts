@@ -20,8 +20,13 @@ export type TDuplex = {
 };
 
 export type TChannelSide = "consumer" | "daemon";
-export type TChannelCloseReason = string;
-export type TMuxEventHandler = (payload: Uint8Array) => void;
+/**
+ * Local mux lifecycle detail. It deliberately remains open-vocabulary: hosts
+ * add transport-specific teardown context which is not part of the protocol.
+ */
+export type TMuxCloseReason = string;
+/** Return `false` to defer receive-window credit until `stream.consume()`. */
+export type TMuxEventHandler = (payload: Uint8Array) => unknown;
 
 export type TMuxStream = {
   readonly id: number;
@@ -29,6 +34,8 @@ export type TMuxStream = {
   readonly end: () => void;
   readonly reset: (payload?: Uint8Array) => void;
   readonly sendCtrl: (payload: Uint8Array) => void;
+  /** Replenish receive-window credit after a deferred DATA delivery is consumed. */
+  readonly consume: (bytes: number) => void;
   readonly onData: (handler: TMuxEventHandler) => () => void;
   readonly onEnd: (handler: () => void) => () => void;
   readonly onReset: (handler: TMuxEventHandler) => () => void;
@@ -42,7 +49,7 @@ export type TMuxChannel = {
   readonly onStream: (
     handler: (stream: TMuxStream, openPayload: Uint8Array) => void,
   ) => () => void;
-  readonly close: (reason?: TChannelCloseReason) => void;
+  readonly close: (reason?: TMuxCloseReason) => void;
   readonly openStreamCount: () => number;
 };
 
@@ -50,7 +57,7 @@ export type TCreateChannelOptions = {
   readonly duplex: TDuplex;
   readonly side: TChannelSide;
   readonly onStream?: (stream: TMuxStream, openPayload: Uint8Array) => void;
-  readonly onClose?: (reason: TChannelCloseReason) => void;
+  readonly onClose?: (reason: TMuxCloseReason) => void;
   /**
    * Sender-side DATA payload cap (bytes). Defaults to {@link MAX_PAYLOAD_BYTES}.
    * Used to stay under transport message-size limits (e.g. SCTP `maxMessageSize`
@@ -77,6 +84,7 @@ type TStreamState = {
   readonly pending: TPendingWrite[];
   sendCredit: number;
   receiveCredit: number;
+  receivedUnconsumed: number;
   consumedSinceWindow: number;
   localEnded: boolean;
   remoteEnded: boolean;
@@ -161,7 +169,7 @@ export const createChannel = (options: TCreateChannelOptions): TMuxChannel => {
     );
   };
 
-  const close = (reason: TChannelCloseReason = "done"): void => {
+  const close = (reason: TMuxCloseReason = "done"): void => {
     if (closed) return;
     closed = true;
     for (const state of [...streams.values()]) localReset(state);
@@ -229,6 +237,7 @@ export const createChannel = (options: TCreateChannelOptions): TMuxChannel => {
     pending: [],
     sendCredit: INITIAL_STREAM_WINDOW_BYTES,
     receiveCredit: INITIAL_STREAM_WINDOW_BYTES,
+    receivedUnconsumed: 0,
     consumedSinceWindow: 0,
     localEnded: false,
     remoteEnded: false,
@@ -264,6 +273,24 @@ export const createChannel = (options: TCreateChannelOptions): TMuxChannel => {
       },
       sendCtrl: (payload) => {
         if (!state.reset && !closed) send(FRAME_TYPE.ctrl, state.id, payload);
+      },
+      consume: (bytes) => {
+        if (state.reset || closed) return;
+        if (!Number.isSafeInteger(bytes) || bytes < 0) {
+          throw new RangeError(
+            "consumed byte count must be a non-negative integer",
+          );
+        }
+        if (bytes > state.receivedUnconsumed) {
+          throw new RangeError("cannot consume more bytes than received");
+        }
+        state.receivedUnconsumed -= bytes;
+        state.consumedSinceWindow += bytes;
+        if (state.consumedSinceWindow < WINDOW_REPLENISH_THRESHOLD) return;
+        const delta = state.consumedSinceWindow;
+        state.receiveCredit += delta;
+        state.consumedSinceWindow = 0;
+        send(FRAME_TYPE.window, state.id, windowPayload(delta));
       },
       onData: (handler) => on(state.dataHandlers, handler),
       onEnd: (handler) => on(state.endHandlers, handler),
@@ -329,14 +356,12 @@ export const createChannel = (options: TCreateChannelOptions): TMuxChannel => {
           return;
         }
         state.receiveCredit -= frame.payload.byteLength;
-        state.consumedSinceWindow += frame.payload.byteLength;
-        emit(state.dataHandlers, (handler) => handler(frame.payload));
-        if (state.consumedSinceWindow >= WINDOW_REPLENISH_THRESHOLD) {
-          const delta = state.consumedSinceWindow;
-          state.receiveCredit += delta;
-          state.consumedSinceWindow = 0;
-          send(FRAME_TYPE.window, state.id, windowPayload(delta));
-        }
+        state.receivedUnconsumed += frame.payload.byteLength;
+        let deferConsume = false;
+        emit(state.dataHandlers, (handler) => {
+          if (handler(frame.payload) === false) deferConsume = true;
+        });
+        if (!deferConsume) state.stream?.consume(frame.payload.byteLength);
         return;
       }
       case FRAME_TYPE.end:

@@ -36,6 +36,8 @@
 import { FRAME_HEADER_BYTES } from "./codec";
 
 export const RTC_AUTH_VERSION = 1 as const;
+/** Default STUN server shared by browser and daemon RTC peers. */
+export const RTC_DEFAULT_STUN = "stun:stun.l.google.com:19302";
 /** Seed-gated offer inner: nests a full device-grant envelope. */
 export const RTC_AUTH_VERSION_2 = 2 as const;
 /** 16 random bytes, base64-encoded in the inner JSON. */

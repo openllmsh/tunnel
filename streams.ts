@@ -47,6 +47,8 @@ const bodyFromStream = (
   let offData: (() => void) | undefined;
   let offEnd: (() => void) | undefined;
   let offReset: (() => void) | undefined;
+  const delivered: number[] = [];
+  let controller: ReadableStreamDefaultController<Uint8Array> | undefined;
   const cleanup = (): void => {
     offData?.();
     offEnd?.();
@@ -56,17 +58,27 @@ const bodyFromStream = (
     offReset = undefined;
   };
   return new ReadableStream<Uint8Array>({
-    start(controller) {
-      offData = stream.onData((bytes) => controller.enqueue(bytes));
+    start(nextController) {
+      controller = nextController;
+      offData = stream.onData((bytes) => {
+        // `pull` runs when the queued chunk is read; defer mux credit until then.
+        delivered.push(bytes.byteLength);
+        nextController.enqueue(bytes);
+        return false;
+      });
       offEnd = stream.onEnd(() => {
         cleanup();
-        controller.close();
+        nextController.close();
       });
       offReset = stream.onReset((payload) => {
         cleanup();
         onReset?.();
-        controller.error(unknownReset(payload));
+        controller?.error(unknownReset(payload));
       });
+    },
+    pull() {
+      const bytes = delivered.shift();
+      if (bytes !== undefined) stream.consume(bytes);
     },
     cancel() {
       cleanup();
