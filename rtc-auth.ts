@@ -97,15 +97,54 @@ export const normalizeFingerprint = (raw: string): string => {
 };
 
 /**
- * Extract `a=fingerprint:` value from an SDP blob. Returns the raw value
- * (algorithm + hex) or null if absent. Caller normalizes for comparison.
+ * Extract effective DTLS fingerprints from an SDP blob.
+ *
+ * Returns all `a=fingerprint:` lines from the first `m=application` section that has
+ * fingerprints; otherwise returns session-level fingerprints (before any `m=`). The
+ * values are raw (algorithm + hex) and preserve order.
+ */
+export const fingerprintsFromSdp = (sdp: string): readonly string[] => {
+  const sessionFingerprints: string[] = [];
+  let applicationFingerprints: string[] | null = null;
+  let inApplicationSection = false;
+  let hasMediaSection = false;
+
+  for (const line of sdp.split(/\r?\n/)) {
+    const trimmed = line.trim();
+    const media = /^m=([^\s]+)/i.exec(trimmed);
+    if (media !== null) {
+      hasMediaSection = true;
+      inApplicationSection = media[1].toLowerCase() === "application";
+      if (inApplicationSection && applicationFingerprints === null) {
+        applicationFingerprints = [];
+      }
+      continue;
+    }
+
+    const match = /^a=fingerprint:(.+)$/i.exec(trimmed);
+    if (match === null) continue;
+    if (inApplicationSection) {
+      applicationFingerprints?.push(match[1].trim());
+      continue;
+    }
+    if (!hasMediaSection) {
+      sessionFingerprints.push(match[1].trim());
+    }
+  }
+
+  return applicationFingerprints !== null && applicationFingerprints.length > 0
+    ? applicationFingerprints
+    : sessionFingerprints;
+};
+
+/**
+ * Extract `a=fingerprint:` value from an SDP blob. Returns the first raw value from
+ * the effective set (session-level or `m=application`) or null if absent. Caller
+ * normalizes for comparison.
  */
 export const fingerprintFromSdp = (sdp: string): string | null => {
-  for (const line of sdp.split(/\r?\n/)) {
-    const m = /^a=fingerprint:(.+)$/i.exec(line.trim());
-    if (m !== null) return m[1].trim();
-  }
-  return null;
+  const fingerprints = fingerprintsFromSdp(sdp);
+  return fingerprints.length > 0 ? fingerprints[0] : null;
 };
 
 /**
