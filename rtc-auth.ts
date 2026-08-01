@@ -138,6 +138,26 @@ export const fingerprintsFromSdp = (sdp: string): readonly string[] => {
 };
 
 /**
+ * True when the effective SDP fingerprint set is non-empty and every entry
+ * matches the sealed/claimed fingerprint after normalization. Conflicting
+ * fingerprint lines are rejected rather than accepting a matching subset.
+ */
+export const sdpFingerprintsMatch = (
+  sdp: string,
+  claimedFingerprint: string,
+): boolean => {
+  const claimed = normalizeFingerprint(claimedFingerprint);
+  const fingerprints = fingerprintsFromSdp(sdp);
+  return (
+    claimed.length > 0 &&
+    fingerprints.length > 0 &&
+    fingerprints.every(
+      (fingerprint) => normalizeFingerprint(fingerprint) === claimed,
+    )
+  );
+};
+
+/**
  * Extract `a=fingerprint:` value from an SDP blob. Returns the first raw value from
  * the effective set (session-level or `m=application`) or null if absent. Caller
  * normalizes for comparison.
