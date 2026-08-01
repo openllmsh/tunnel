@@ -66,6 +66,11 @@ export type TCreateChannelOptions = {
    * back to {@link MAX_PAYLOAD_BYTES}.
    */
   readonly maxPayloadBytes?: number;
+  /**
+   * Maximum number of live peer-opened streams.
+   * Defaults to 256.
+   */
+  readonly maxStreams?: number;
 };
 
 type TPendingWrite = {
@@ -90,6 +95,8 @@ type TStreamState = {
   remoteEnded: boolean;
   endRequested: boolean;
   reset: boolean;
+  /** True only when the peer initiated the OPEN for this stream. */
+  openedByPeer: boolean;
   stream: TMuxStream | null;
 };
 
@@ -133,6 +140,8 @@ export const createChannel = (options: TCreateChannelOptions): TMuxChannel => {
   if (options.onStream !== undefined) streamHandlers.add(options.onStream);
   let nextStreamId = options.side === "consumer" ? 1 : 2;
   let closed = false;
+  // Track how many peer-opened streams are currently live on this side.
+  let peerOpenStreams = 0;
   // Sender-only chunk size. Keep decode-side MAX_PAYLOAD_BYTES as the wire max.
   // Floor before validating so fractional values like 0.9 don't become 0 and
   // permanently stall drain() (Math.min(..., 0) never advances pending writes).
@@ -148,6 +157,18 @@ export const createChannel = (options: TCreateChannelOptions): TMuxChannel => {
     return floored;
   })();
 
+  const maxStreams = (() => {
+    const requested = options.maxStreams;
+    if (requested === undefined) return 256;
+    if (!Number.isFinite(requested)) return 256;
+    const floored = Math.floor(requested);
+    if (floored < 1) return 1;
+    return floored;
+  })();
+
+  const sendResetForExcessOpen = (streamId: number): void => {
+    send(FRAME_TYPE.reset, streamId, new Uint8Array());
+  };
   const send = (
     type: TFrameType,
     streamId: number,
@@ -160,6 +181,9 @@ export const createChannel = (options: TCreateChannelOptions): TMuxChannel => {
   const localReset = (state: TStreamState, payload?: Uint8Array): void => {
     if (state.reset) return;
     state.reset = true;
+    if (state.openedByPeer) {
+      peerOpenStreams -= 1;
+    }
     for (const pending of state.pending.splice(0)) {
       pending.reject(resetError(payload));
     }
@@ -198,8 +222,12 @@ export const createChannel = (options: TCreateChannelOptions): TMuxChannel => {
       return;
     state.localEnded = true;
     send(FRAME_TYPE.end, state.id, new Uint8Array());
-    if (state.remoteEnded && state.pending.length === 0)
+    if (state.remoteEnded && state.pending.length === 0) {
       streams.delete(state.id);
+      if (state.openedByPeer) {
+        peerOpenStreams -= 1;
+      }
+    }
   };
 
   const drain = (state: TStreamState): void => {
@@ -228,7 +256,7 @@ export const createChannel = (options: TCreateChannelOptions): TMuxChannel => {
     sendEndIfReady(state);
   };
 
-  const makeState = (id: number): TStreamState => ({
+  const makeState = (id: number, openedByPeer: boolean): TStreamState => ({
     id,
     dataHandlers: new Set(),
     endHandlers: new Set(),
@@ -243,6 +271,7 @@ export const createChannel = (options: TCreateChannelOptions): TMuxChannel => {
     remoteEnded: false,
     endRequested: false,
     reset: false,
+    openedByPeer,
     stream: null,
   });
 
@@ -307,7 +336,7 @@ export const createChannel = (options: TCreateChannelOptions): TMuxChannel => {
     if (nextStreamId > 0xffff_ffff) throw new Error("stream ids exhausted");
     const id = nextStreamId;
     nextStreamId += 2;
-    const state = makeState(id);
+    const state = makeState(id, false);
     const stream = makeStream(state);
     streams.set(id, state);
     send(FRAME_TYPE.open, id, openPayload);
@@ -334,8 +363,13 @@ export const createChannel = (options: TCreateChannelOptions): TMuxChannel => {
         protocolError();
         return;
       }
-      const state = makeState(frame.streamId);
+      if (peerOpenStreams >= maxStreams) {
+        sendResetForExcessOpen(frame.streamId);
+        return;
+      }
+      const state = makeState(frame.streamId, true);
       const stream = makeStream(state);
+      peerOpenStreams += 1;
       streams.set(frame.streamId, state);
       emit(streamHandlers, (handler) => handler(stream, frame.payload));
       return;
@@ -378,8 +412,12 @@ export const createChannel = (options: TCreateChannelOptions): TMuxChannel => {
         }
         state.remoteEnded = true;
         emit(state.endHandlers, (handler) => handler());
-        if (state.localEnded && state.pending.length === 0)
+        if (state.localEnded && state.pending.length === 0) {
           streams.delete(state.id);
+          if (state.openedByPeer) {
+            peerOpenStreams -= 1;
+          }
+        }
         return;
       case FRAME_TYPE.reset:
         localReset(state, frame.payload);
