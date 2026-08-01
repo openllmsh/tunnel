@@ -1,7 +1,7 @@
 import type {
+  TDeviceSessionCli,
   TSessionStreamOpenPayload,
   TStreamResetCode,
-  TSubscriptionProviderSlug,
   TTunnelForwardHeaders,
   TTunnelResponseHeaders,
   TTunnelStreamOpenPayload,
@@ -227,13 +227,17 @@ export const tunnelStream = (
 
 export type TSessionStreamOptions = {
   readonly sessionId: string;
-  readonly cli: TSubscriptionProviderSlug;
+  readonly cli: TDeviceSessionCli;
   readonly cols: number;
   readonly rows: number;
   readonly mode: "spawn" | "attach" | "continue";
   readonly title?: string;
   /** Maps to `openllm -d <client>` for CLIs that support skip-approvals. */
   readonly dangerous?: boolean;
+  /** Vendor session id for cold resume (`spawn` only). */
+  readonly resumeSessionId?: string;
+  /** Absolute cwd for spawn/continue; daemon-validated. Omitted → `$HOME`. */
+  readonly cwd?: string;
   /**
    * Abort cancels an in-flight open (RESET + reject) so callers can time out
    * without leaving a dangling mux stream that later races a retry.
@@ -272,6 +276,10 @@ export const sessionStream = (
       mode: options.mode,
       ...(options.title === undefined ? {} : { title: options.title }),
       ...(options.dangerous === true ? { dangerous: true } : {}),
+      ...(options.resumeSessionId === undefined
+        ? {}
+        : { resume_session_id: options.resumeSessionId }),
+      ...(options.cwd === undefined ? {} : { cwd: options.cwd }),
     }),
   );
   const replayHandlers = new Set<() => void>();
