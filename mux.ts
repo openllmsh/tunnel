@@ -361,7 +361,13 @@ export const createChannel = (options: TCreateChannelOptions): TMuxChannel => {
         emit(state.dataHandlers, (handler) => {
           if (handler(frame.payload) === false) deferConsume = true;
         });
-        if (!deferConsume) state.stream?.consume(frame.payload.byteLength);
+        if (!deferConsume) {
+          const unconsumed = Math.min(
+            frame.payload.byteLength,
+            state.receivedUnconsumed,
+          );
+          if (unconsumed > 0) state.stream?.consume(unconsumed);
+        }
         return;
       }
       case FRAME_TYPE.end:

@@ -147,6 +147,16 @@ export const negotiateRtcPayloadCap = (
 const isNonEmptyString = (value: unknown): value is string =>
   typeof value === "string" && value.length > 0;
 
+/** True when a nonce is base64 of exactly RTC_AUTH_NONCE_BYTES bytes. */
+const isValidNonce = (value: unknown): value is string => {
+  if (!isNonEmptyString(value)) return false;
+  try {
+    return atob(value).length === RTC_AUTH_NONCE_BYTES;
+  } catch {
+    return false;
+  }
+};
+
 export const encodeOfferInner = (inner: TRtcOfferInner): string => {
   if (inner.v === RTC_AUTH_VERSION_2) {
     return JSON.stringify({
@@ -171,7 +181,7 @@ export const decodeOfferInner = (json: string): TRtcOfferInner | null => {
     if (parsed === null || typeof parsed !== "object") return null;
     const o = parsed as Record<string, unknown>;
     if (
-      !isNonEmptyString(o.n) ||
+      !isValidNonce(o.n) ||
       !isNonEmptyString(o.fb) ||
       !isNonEmptyString(o.epk)
     ) {
