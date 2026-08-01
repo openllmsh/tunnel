@@ -255,8 +255,9 @@ export const createChannel = (options: TCreateChannelOptions): TMuxChannel => {
         if (state.reset || closed)
           return Promise.reject(new Error("stream is closed"));
         if (bytes.byteLength === 0) return Promise.resolve();
+        const queued = new Uint8Array(bytes);
         return new Promise<void>((resolve, reject) => {
-          state.pending.push({ bytes, offset: 0, resolve, reject });
+          state.pending.push({ bytes: queued, offset: 0, resolve, reject });
           drain(state);
         });
       },
