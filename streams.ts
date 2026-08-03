@@ -263,6 +263,8 @@ export type TSessionStreamResult = {
   readonly stdout: ReadableStream<Uint8Array>;
   readonly write: (bytes: Uint8Array) => Promise<void>;
   readonly resize: (cols: number, rows: number) => void;
+  /** Claim primary (active-viewer) status without typing. Skew-safe. */
+  readonly focus: () => void;
   readonly detach: () => void;
   readonly kill: () => void;
   readonly onReplayDone: (callback: () => void) => () => void;
@@ -367,6 +369,7 @@ export const sessionStream = (
         write: stream.write,
         resize: (cols, rows) =>
           stream.sendCtrl(encodeJsonPayload({ t: "resize", cols, rows })),
+        focus: () => stream.sendCtrl(encodeJsonPayload({ t: "focus" })),
         detach: () => {
           stream.end();
           finish("detach");
