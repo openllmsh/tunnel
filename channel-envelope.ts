@@ -59,6 +59,8 @@ export const channelIdFromBytes = (tag: Uint8Array): string | null => {
 
 /**
  * Derive a reconnect-stable UUID for one browser-device-to-device mux channel.
+ * Callers must allocate distinct slots for concurrent channels sharing userId,
+ * keyId, and browserDeviceId; slot is the disambiguating identity component.
  * NUL delimiters make the UTF-8 identity encoding unambiguous.
  */
 export const stableChannelId = async (
