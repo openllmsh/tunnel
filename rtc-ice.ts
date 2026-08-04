@@ -24,17 +24,25 @@
  */
 
 const MDNS_PREFLIGHT_TIMEOUT_MS = 250;
+const MDNS_VERDICT_TTL_MS = 60_000;
 
 /** Cached preflight verdict: true = `.local` resolved quickly (LAN) → keep
  *  feeding candidates to werift; false = skip them fast. */
 let mdnsVerdict: boolean | null = null;
+let mdnsVerdictAtMs: number | null = null;
 let mdnsPreflightInFlight: Promise<boolean> | null = null;
+
+const mdnsHostFromCandidate = (candidate: string): string | null => {
+  const match = /(?:^|\s)([a-z0-9-]+\.local)(?:\s|$)/i.exec(candidate);
+  return match?.[1] ?? null;
+};
 
 /** True when the candidate init carries an mDNS `.local` host name. */
 export const isMdnsCandidate = (init: {
   readonly candidate?: string | null;
 }): boolean =>
-  typeof init.candidate === "string" && init.candidate.includes(".local");
+  typeof init.candidate === "string" &&
+  mdnsHostFromCandidate(init.candidate) !== null;
 
 const lookupOnce = async (host: string): Promise<boolean> => {
   const { lookup } = await import("node:dns/promises");
@@ -64,13 +72,20 @@ export const preflightIceCandidate = async (init: {
 }): Promise<boolean> => {
   const candidate = init.candidate;
   if (typeof candidate !== "string") return true;
-  const match = / ([a-z0-9-]+\.local) /i.exec(candidate);
-  if (match === null) return true;
-  if (mdnsVerdict !== null) return mdnsVerdict;
+  const host = mdnsHostFromCandidate(candidate);
+  if (host === null) return true;
+  if (
+    mdnsVerdict !== null &&
+    mdnsVerdictAtMs !== null &&
+    Date.now() - mdnsVerdictAtMs < MDNS_VERDICT_TTL_MS
+  ) {
+    return mdnsVerdict;
+  }
   if (mdnsPreflightInFlight === null) {
-    mdnsPreflightInFlight = lookupOnce(match[1])
+    mdnsPreflightInFlight = lookupOnce(host)
       .then((ok) => {
         mdnsVerdict = ok;
+        mdnsVerdictAtMs = Date.now();
         return ok;
       })
       .finally(() => {
@@ -83,5 +98,6 @@ export const preflightIceCandidate = async (init: {
 /** Test-only: clear the cached LAN verdict between cases. */
 export const resetMdnsPreflightForTest = (): void => {
   mdnsVerdict = null;
+  mdnsVerdictAtMs = null;
   mdnsPreflightInFlight = null;
 };

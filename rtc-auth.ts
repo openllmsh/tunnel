@@ -33,17 +33,54 @@
  * `a=fingerprint:sha-256 AA:BB:…` and bare hex compare equal.
  */
 
+import type { TIceServer } from "@openllmsh/protocol";
 import { FRAME_HEADER_BYTES } from "./codec";
 
 export const RTC_AUTH_VERSION = 1 as const;
 /** Default STUN server shared by browser and daemon RTC peers. */
 export const RTC_DEFAULT_STUN = "stun:stun.l.google.com:19302";
 
-/** One ICE server entry (STUN or TURN), matching `RTCIceServer`. */
-export type TIceServer = {
-  readonly urls: string | ReadonlyArray<string>;
-  readonly username?: string;
-  readonly credential?: string;
+/** Return a fresh default ICE configuration for callers that need STUN-only. */
+export const defaultIceServers = (): ReadonlyArray<TIceServer> => [
+  { urls: RTC_DEFAULT_STUN },
+];
+
+/** Map immutable protocol ICE entries into werift's mutable input shape. */
+export const weriftIceServers = (
+  servers: ReadonlyArray<TIceServer>,
+): Array<{
+  urls: string | string[];
+  username?: string;
+  credential?: string;
+}> =>
+  servers.map((server) => ({
+    urls: typeof server.urls === "string" ? server.urls : [...server.urls],
+    ...(server.username !== undefined ? { username: server.username } : {}),
+    ...(server.credential !== undefined
+      ? { credential: server.credential }
+      : {}),
+  }));
+
+const isIceUrl = (value: string): boolean => {
+  try {
+    const url = new URL(value);
+    return ["stun:", "stuns:", "turn:", "turns:"].includes(url.protocol);
+  } catch {
+    return false;
+  }
+};
+
+const iceUrls = (value: unknown): string | string[] | null => {
+  if (typeof value === "string") {
+    const url = value.trim();
+    return isIceUrl(url) ? url : null;
+  }
+  if (!Array.isArray(value)) return null;
+  const urls = value
+    .filter((url): url is string => typeof url === "string")
+    .map((url) => url.trim())
+    .filter(isIceUrl);
+  return urls.length > 0 ? urls : null;
 };
 
 /** Parse an ICE-server configuration string into RTCPeerConnection entries.
@@ -63,9 +100,7 @@ export const parseIceServers = (
   raw: string | undefined,
 ): ReadonlyArray<TIceServer> => {
   const trimmed = raw?.trim();
-  if (trimmed === undefined || trimmed.length === 0) {
-    return [{ urls: RTC_DEFAULT_STUN }];
-  }
+  if (trimmed === undefined || trimmed.length === 0) return defaultIceServers();
   if (trimmed.startsWith("[")) {
     try {
       const parsed: unknown = JSON.parse(trimmed);
@@ -74,24 +109,20 @@ export const parseIceServers = (
         for (const entry of parsed) {
           if (entry === null || typeof entry !== "object") continue;
           const record = entry as Record<string, unknown>;
-          const urls = record.urls;
-          const urlsOk =
-            (typeof urls === "string" && urls.length > 0) ||
-            (Array.isArray(urls) &&
-              urls.length > 0 &&
-              urls.every((u) => typeof u === "string" && u.length > 0));
-          if (!urlsOk) continue;
+          const urls = iceUrls(record.urls);
+          if (urls === null) continue;
           const username =
-            typeof record.username === "string" && record.username.length > 0
-              ? record.username
+            typeof record.username === "string" &&
+            record.username.trim().length > 0
+              ? record.username.trim()
               : undefined;
           const credential =
             typeof record.credential === "string" &&
-            record.credential.length > 0
-              ? record.credential
+            record.credential.trim().length > 0
+              ? record.credential.trim()
               : undefined;
           servers.push({
-            urls: urls as TIceServer["urls"],
+            urls,
             ...(username !== undefined ? { username } : {}),
             ...(credential !== undefined ? { credential } : {}),
           });
@@ -101,14 +132,14 @@ export const parseIceServers = (
     } catch {
       // fall through to the default — a malformed JSON list must not kill RTC
     }
-    return [{ urls: RTC_DEFAULT_STUN }];
+    return defaultIceServers();
   }
   const legacy = trimmed
     .split(",")
     .map((value) => value.trim())
-    .filter((value) => value.length > 0)
+    .filter(isIceUrl)
     .map((urls) => ({ urls }));
-  return legacy.length > 0 ? legacy : [{ urls: RTC_DEFAULT_STUN }];
+  return legacy.length > 0 ? legacy : defaultIceServers();
 };
 
 /** Resolve the effective ICE servers for an RTC peer, in precedence order:
@@ -126,7 +157,7 @@ export const resolveIceServers = (
     return parseIceServers(trimmed);
   }
   if (handshake !== null && handshake.length > 0) return handshake;
-  return [{ urls: RTC_DEFAULT_STUN }];
+  return defaultIceServers();
 };
 
 /** Seed-gated offer inner: nests a full device-grant envelope. */
