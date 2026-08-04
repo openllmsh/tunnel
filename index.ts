@@ -5,9 +5,11 @@
  * existing mux via {@link rtcDuplex}; fingerprint binding is pure helpers in
  * `rtc-auth.ts` (hosts supply seal/open).
  */
+export * from "./channel-envelope";
 export * from "./codec";
 export * from "./device-grant";
 export * from "./mux";
 export * from "./rtc-auth";
 export * from "./rtc-duplex";
+export * from "./rtc-ice";
 export * from "./streams";

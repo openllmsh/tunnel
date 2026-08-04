@@ -38,6 +38,97 @@ import { FRAME_HEADER_BYTES } from "./codec";
 export const RTC_AUTH_VERSION = 1 as const;
 /** Default STUN server shared by browser and daemon RTC peers. */
 export const RTC_DEFAULT_STUN = "stun:stun.l.google.com:19302";
+
+/** One ICE server entry (STUN or TURN), matching `RTCIceServer`. */
+export type TIceServer = {
+  readonly urls: string | ReadonlyArray<string>;
+  readonly username?: string;
+  readonly credential?: string;
+};
+
+/** Parse an ICE-server configuration string into RTCPeerConnection entries.
+ *
+ *  Accepts, in order of precedence of the input shape:
+ *    - undefined / empty → the default Google STUN entry;
+ *    - a JSON array of ice-server objects
+ *      (`[{urls, username?, credential?}, …]` — the TURN-ready form served by
+ *      the cloud via the `/api/daemon/channel` handshake and set directly via
+ *      `OPENLLM_RTC_ICE_SERVERS`);
+ *    - a legacy comma-separated STUN URL list (the historical
+ *      `OPENLLM_RTC_STUN` form).
+ *
+ *  Malformed input (bad JSON, wrong shape, no usable urls) falls back to the
+ *  default so a config typo degrades to STUN-only instead of killing RTC. */
+export const parseIceServers = (
+  raw: string | undefined,
+): ReadonlyArray<TIceServer> => {
+  const trimmed = raw?.trim();
+  if (trimmed === undefined || trimmed.length === 0) {
+    return [{ urls: RTC_DEFAULT_STUN }];
+  }
+  if (trimmed.startsWith("[")) {
+    try {
+      const parsed: unknown = JSON.parse(trimmed);
+      if (Array.isArray(parsed)) {
+        const servers: TIceServer[] = [];
+        for (const entry of parsed) {
+          if (entry === null || typeof entry !== "object") continue;
+          const record = entry as Record<string, unknown>;
+          const urls = record.urls;
+          const urlsOk =
+            (typeof urls === "string" && urls.length > 0) ||
+            (Array.isArray(urls) &&
+              urls.length > 0 &&
+              urls.every((u) => typeof u === "string" && u.length > 0));
+          if (!urlsOk) continue;
+          const username =
+            typeof record.username === "string" && record.username.length > 0
+              ? record.username
+              : undefined;
+          const credential =
+            typeof record.credential === "string" &&
+            record.credential.length > 0
+              ? record.credential
+              : undefined;
+          servers.push({
+            urls: urls as TIceServer["urls"],
+            ...(username !== undefined ? { username } : {}),
+            ...(credential !== undefined ? { credential } : {}),
+          });
+        }
+        if (servers.length > 0) return servers;
+      }
+    } catch {
+      // fall through to the default — a malformed JSON list must not kill RTC
+    }
+    return [{ urls: RTC_DEFAULT_STUN }];
+  }
+  const legacy = trimmed
+    .split(",")
+    .map((value) => value.trim())
+    .filter((value) => value.length > 0)
+    .map((urls) => ({ urls }));
+  return legacy.length > 0 ? legacy : [{ urls: RTC_DEFAULT_STUN }];
+};
+
+/** Resolve the effective ICE servers for an RTC peer, in precedence order:
+ *    1. a locally-set env value (`OPENLLM_RTC_ICE_SERVERS`, or the legacy
+ *       `OPENLLM_RTC_STUN` STUN list) — parsed via {@link parseIceServers};
+ *    2. the cloud-served `ice_servers` from the channel handshake;
+ *    3. the default STUN entry.
+ *  Shared by both daemon RTC ends so browser/daemon agree on the surface. */
+export const resolveIceServers = (
+  envRaw: string | undefined,
+  handshake: ReadonlyArray<TIceServer> | null,
+): ReadonlyArray<TIceServer> => {
+  const trimmed = envRaw?.trim();
+  if (trimmed !== undefined && trimmed.length > 0) {
+    return parseIceServers(trimmed);
+  }
+  if (handshake !== null && handshake.length > 0) return handshake;
+  return [{ urls: RTC_DEFAULT_STUN }];
+};
+
 /** Seed-gated offer inner: nests a full device-grant envelope. */
 export const RTC_AUTH_VERSION_2 = 2 as const;
 /** 16 random bytes, base64-encoded in the inner JSON. */

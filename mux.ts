@@ -218,7 +218,8 @@ export const createChannel = (options: TCreateChannelOptions): TMuxChannel => {
   const protocolError = (): void => close("protocol_error");
 
   const tryRetireStreamState = (state: TStreamState): void => {
-    if (!state.localEnded || !state.remoteEnded || state.pending.length > 0) return;
+    if (!state.localEnded || !state.remoteEnded || state.pending.length > 0)
+      return;
     retireStreamState(state);
   };
 
