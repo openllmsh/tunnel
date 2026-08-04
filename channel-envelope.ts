@@ -57,6 +57,32 @@ export const channelIdFromBytes = (tag: Uint8Array): string | null => {
   return isChannelId(text) ? text : null;
 };
 
+/**
+ * Derive a reconnect-stable UUID for one browser-device-to-device mux channel.
+ * NUL delimiters make the UTF-8 identity encoding unambiguous.
+ */
+export const stableChannelId = async (
+  userId: string,
+  keyId: string,
+  browserDeviceId: string,
+  slot = 0,
+): Promise<string> => {
+  const identity = `${userId}\0${keyId}\0${browserDeviceId}\0${slot}`;
+  const digest = await crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(identity),
+  );
+  const tag = new Uint8Array(digest.slice(0, CHANNEL_ENVELOPE_TAG_BYTES));
+  tag[6] = (tag[6] & 0x0f) | 0x40;
+  tag[8] = (tag[8] & 0x3f) | 0x80;
+
+  const channelId = channelIdFromBytes(tag);
+  if (channelId === null) {
+    throw new Error("derived channel id is not canonical");
+  }
+  return channelId;
+};
+
 /** Wrap one whole WebSocket message. Caller contract violations throw RangeError. */
 export const encodeChannelEnvelope = (
   channelId: string,
