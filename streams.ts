@@ -165,6 +165,13 @@ export type TTunnelStreamOptions = {
    * {@link TUNNEL_RESPONSE_HEAD_TIMEOUT_MS} (legacy tunnel parity).
    */
   readonly headTimeoutMs?: number;
+  /**
+   * Who opened this stream. Daemon fleet hops set `"daemon"` so the serving
+   * end can stamp the walker loop-guard (`x-openllm-tunneled`). Browser
+   * omits this (or sets `"browser"`) so the selected device may still
+   * `tryFleetTunnel` once. See browser-selected-device-tunnel-contract.
+   */
+  readonly consumer?: "browser" | "daemon";
 };
 
 export type TTunnelStreamResult = {
@@ -185,6 +192,9 @@ export const tunnelStream = (
         method: "POST",
         surface: options.surface,
         ...(options.headers === undefined ? {} : { headers: options.headers }),
+        ...(options.consumer === undefined
+          ? {}
+          : { consumer: options.consumer }),
       }),
     );
     let settled = false;
