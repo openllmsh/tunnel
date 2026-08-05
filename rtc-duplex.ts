@@ -84,14 +84,18 @@ export const rtcDuplex = (dc: TRtcDataChannelLike): TDuplex => {
   };
 
   const onMessage = (event: { data: unknown }): void => {
-    if (peerGone) return;
+    // Local close marks channelClosed before peer events drain; ignore any
+    // queued message after closeChannel() so deliver() cannot run post-close.
+    if (channelClosed || peerGone) return;
     const bytes = toUint8(event.data);
     if (bytes === null) return;
     deliver(bytes);
   };
 
   const onPeerGone = (): void => {
-    if (peerGone) return;
+    // Same post-close guard as onMessage — a queued close/error must not
+    // deliver terminal null after the local side already closed the channel.
+    if (channelClosed || peerGone) return;
     peerGone = true;
     // Deliver AFTER flipping peerGone so re-entrant close is a no-op, but the
     // terminal null still reaches the mux.
