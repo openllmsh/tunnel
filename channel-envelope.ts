@@ -4,8 +4,9 @@
  * The frozen mux codec (`codec.ts`) has no channel id in its nine-byte header,
  * so a relay route by sender-socket identity alone caps every socket at one
  * mux channel. The envelope fixes that WITHOUT touching the frozen codec: it
- * wraps the WHOLE WebSocket message — a 16-byte channel UUID (RFC 4122 text
- * form, hyphenated lowercase, 36 chars) prepended to the binary payload:
+ * wraps the WHOLE WebSocket message — the 16 raw bytes of the channel UUID
+ * prepended to the binary payload. The in-memory `channelId` is the RFC 4122
+ * text form (hyphenated lowercase, 36 chars):
  *
  * ```
  * ┌───────────────────────────┬──────────────────────────┐

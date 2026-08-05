@@ -25,6 +25,7 @@
 
 const MDNS_PREFLIGHT_TIMEOUT_MS = 250;
 const MDNS_VERDICT_TTL_MS = 60_000;
+const MDNS_NEGATIVE_VERDICT_TTL_MS = 1_000;
 
 /** Cached preflight verdict: true = `.local` resolved quickly (LAN) → keep
  *  feeding candidates to werift; false = skip them fast. */
@@ -77,7 +78,8 @@ export const preflightIceCandidate = async (init: {
   if (
     mdnsVerdict !== null &&
     mdnsVerdictAtMs !== null &&
-    Date.now() - mdnsVerdictAtMs < MDNS_VERDICT_TTL_MS
+    Date.now() - mdnsVerdictAtMs <
+      (mdnsVerdict ? MDNS_VERDICT_TTL_MS : MDNS_NEGATIVE_VERDICT_TTL_MS)
   ) {
     return mdnsVerdict;
   }

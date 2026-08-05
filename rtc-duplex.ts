@@ -62,7 +62,18 @@ const toUint8 = (data: unknown): Uint8Array | null => {
  */
 export const rtcDuplex = (dc: TRtcDataChannelLike): TDuplex => {
   let listener: ((bytes: Uint8Array | null) => void) | null = null;
-  let closed = false;
+  let peerGone = false;
+  let channelClosed = false;
+
+  const closeChannel = (): void => {
+    if (channelClosed) return;
+    channelClosed = true;
+    try {
+      dc.close();
+    } catch {
+      // already closed
+    }
+  };
 
   const deliver = (bytes: Uint8Array | null): void => {
     try {
@@ -73,16 +84,16 @@ export const rtcDuplex = (dc: TRtcDataChannelLike): TDuplex => {
   };
 
   const onMessage = (event: { data: unknown }): void => {
-    if (closed) return;
+    if (peerGone) return;
     const bytes = toUint8(event.data);
     if (bytes === null) return;
     deliver(bytes);
   };
 
   const onPeerGone = (): void => {
-    if (closed) return;
-    closed = true;
-    // Deliver AFTER flipping closed so re-entrant close is a no-op, but the
+    if (peerGone) return;
+    peerGone = true;
+    // Deliver AFTER flipping peerGone so re-entrant close is a no-op, but the
     // terminal null still reaches the mux.
     deliver(null);
   };
@@ -99,7 +110,7 @@ export const rtcDuplex = (dc: TRtcDataChannelLike): TDuplex => {
 
   return {
     send: (bytes) => {
-      if (closed) return;
+      if (peerGone || channelClosed) return;
       if (dc.readyState !== "open") {
         // Non-open (closing/closed/connecting) is a transport failure: mux
         // resolves write() once duplex.send returns, so silent drop would
@@ -119,13 +130,7 @@ export const rtcDuplex = (dc: TRtcDataChannelLike): TDuplex => {
       listener = callback;
     },
     close: () => {
-      if (closed) return;
-      closed = true;
-      try {
-        dc.close();
-      } catch {
-        // already closed
-      }
+      closeChannel();
       // Do not deliver null here — local close is not peer death; the mux's
       // own close() already tears streams down before calling duplex.close().
     },

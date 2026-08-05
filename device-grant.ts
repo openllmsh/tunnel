@@ -70,7 +70,11 @@ export const encodeDeviceGrant = (envelope: TDeviceGrantEnvelope): string => {
   for (let i = 0; i < bytes.length; i++) {
     bin += String.fromCharCode(bytes[i] as number);
   }
-  return btoa(bin);
+  const b64 = btoa(bin);
+  if (b64.length > DEVICE_GRANT_B64_MAX) {
+    throw new RangeError("device grant exceeds DEVICE_GRANT_B64_MAX");
+  }
+  return b64;
 };
 
 const isNonEmptyString = (value: unknown): value is string => {

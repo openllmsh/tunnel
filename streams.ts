@@ -36,13 +36,14 @@ const unknownReset = (payload: Uint8Array): Error => {
 };
 
 /**
- * Mirror a mux stream as a ReadableStream. Cancelling the body (e.g. a
- * consumer dropping a Response body) RESETs the remote stream so the peer
- * can abort its work.
+ * Mirror a mux stream as a ReadableStream. Cancelling a response body RESETs
+ * the remote stream so the peer can abort its work. Request-body cancellation
+ * only detaches the local reader: the peer may already have sent a response.
  */
 const bodyFromStream = (
   stream: TMuxStream,
   onReset?: () => void,
+  resetOnCancel = true,
 ): ReadableStream<Uint8Array> => {
   let offData: (() => void) | undefined;
   let offEnd: (() => void) | undefined;
@@ -82,7 +83,9 @@ const bodyFromStream = (
     },
     cancel() {
       cleanup();
-      stream.reset(streamReset("peer_gone", "consumer cancelled"));
+      if (resetOnCancel) {
+        stream.reset(streamReset("peer_gone", "consumer cancelled"));
+      }
     },
   });
 };
@@ -541,7 +544,7 @@ export const serveStream =
     }
     const abort = new AbortController();
     const offReset = stream.onReset(() => abort.abort());
-    const body = bodyFromStream(stream, () => abort.abort());
+    const body = bodyFromStream(stream, () => abort.abort(), false);
     void options
       .tunnel(open, body, abort.signal)
       .then((response) => sendResponse(stream, response, abort.signal))
