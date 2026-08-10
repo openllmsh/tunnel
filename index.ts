@@ -11,4 +11,5 @@ export * from "./device-grant";
 export * from "./mux";
 export * from "./rtc-auth";
 export * from "./rtc-duplex";
+export * from "./stream-reset-error";
 export * from "./streams";

@@ -11,13 +11,16 @@ import {
   parseStreamCtrlPayload,
   parseStreamOpenPayload,
   parseStreamResetPayload,
+  StreamResetCode,
 } from "@openllmsh/protocol";
+import { Schema } from "effect";
 import {
   decodeJsonPayload,
   encodeJsonPayload,
   MAX_PAYLOAD_BYTES,
 } from "./codec";
 import type { TMuxChannel, TMuxStream } from "./mux";
+import { StreamResetError } from "./stream-reset-error";
 
 /** Default wait for the serving end's `res_head` CTRL (matches legacy tunnel). */
 export const TUNNEL_RESPONSE_HEAD_TIMEOUT_MS = 120_000;
@@ -30,10 +33,16 @@ const resetCode = (payload: Uint8Array): TStreamResetCode | null => {
   return decoded?.code ?? null;
 };
 
-const unknownReset = (payload: Uint8Array): Error => {
+const unknownReset = (payload: Uint8Array): StreamResetError => {
   const parsed = parseStreamResetPayload(decodeJsonPayload(payload));
-  return new Error(parsed?.message ?? parsed?.code ?? "stream reset");
+  return new StreamResetError(
+    parsed?.code ?? "protocol_error",
+    parsed?.message ?? parsed?.code ?? "stream reset",
+  );
 };
+
+const isStreamResetCode = (value: unknown): value is TStreamResetCode =>
+  Schema.is(StreamResetCode)(value);
 
 /**
  * Mirror a mux stream as a ReadableStream. Cancelling a response body RESETs
@@ -338,7 +347,7 @@ export const sessionStream = (
       // the same session id without session_busy from a dangling stream.
       stream.reset(streamReset("timeout", "session open timed out"));
       finish("timeout");
-      settleReject(new Error("session open timed out"));
+      settleReject(new StreamResetError("timeout", "session open timed out"));
     };
     const offReset = stream.onReset((payload) => {
       const code = resetCode(payload) ?? "protocol_error";
@@ -368,10 +377,15 @@ export const sessionStream = (
             ? ctrl.error
             : undefined) ??
           "session refused";
+        const nackCode = isStreamResetCode(ctrl.error)
+          ? ctrl.error
+          : "protocol_error";
+        // Settle first so the local onReset from stream.reset() cannot replace
+        // the daemon's typed nack code with the wire-close protocol_error.
+        settleReject(new StreamResetError(nackCode, detail));
         stream.reset(streamReset("protocol_error", detail));
         // Settle `closed` so callers waiting on it don't hang after a nack.
         finish("protocol_error");
-        settleReject(new Error(detail));
         return;
       }
       settled = true;
