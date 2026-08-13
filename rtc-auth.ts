@@ -40,10 +40,23 @@ export const RTC_AUTH_VERSION = 1 as const;
 /** Default STUN server shared by browser and daemon RTC peers. */
 export const RTC_DEFAULT_STUN = "stun:stun.l.google.com:19302";
 
-/** Return a fresh default ICE configuration for callers that need STUN-only. */
-export const defaultIceServers = (): ReadonlyArray<TIceServer> => [
-  { urls: RTC_DEFAULT_STUN },
+/**
+ * Default STUN fallback list for STUN-only sessions.
+ *
+ * Keep multiple independent providers here so a single provider failure does not
+ * zero out server-reflexive candidates. This is a resilience improvement for
+ * provider diversity, but it does not replace TURN for fully UDP-blocked
+ * networks.
+ */
+export const RTC_DEFAULT_STUN_SERVERS: ReadonlyArray<string> = [
+  RTC_DEFAULT_STUN,
+  "stun:stun1.l.google.com:19302",
+  "stun:stun.cloudflare.com:3478",
 ];
+
+/** Return a fresh default ICE configuration for callers that need STUN-only. */
+export const defaultIceServers = (): ReadonlyArray<TIceServer> =>
+  RTC_DEFAULT_STUN_SERVERS.map((url) => ({ urls: url }));
 
 /** Map immutable protocol ICE entries into werift's mutable input shape. */
 export const weriftIceServers = (
