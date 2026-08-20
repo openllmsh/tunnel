@@ -8,20 +8,24 @@
 
 | Layer | Responsibility | Must not know |
 | --- | --- | --- |
-| `codec.ts` | Frozen binary frame layout and bounded JSON/window helpers | Stream semantics or payload schemas |
-| `channel-envelope.ts` | 16-byte channel-UUID wrapper around a WHOLE relay-WS message (`mux2`), so one relay socket multiplexes several channels | Mux stream/flow semantics or payload schemas |
+| `codec.ts` | Frozen binary frame layout and bounded JSON/window helpers; codec-only relay subpath (`@openllmsh/tunnel/codec`) | Stream semantics or payload schemas |
+| `channel-envelope.ts` | 16-byte channel-UUID wrapper around one whole relay-WS mux message (`mux2`), so one relay socket multiplexes several channels | Mux stream/flow semantics or payload schemas |
 | `mux.ts` | Per-stream credits, lifecycle, parity, backpressure; optional sender-side `maxPayloadBytes` for SCTP-sized transports | Tunnel payload shape or host I/O |
 | `streams.ts` | OPEN/CTRL/RESET helpers and fetch-shaped tunnel stream APIs (`tunnelStream` / `serveStream`) | Relay routing and WebSocket mechanics |
+| `stream-reset-error.ts` | Typed application-level reset error | Mux lifecycle or protocol parsing |
 | `device-grant.ts` | Canonical device-grant envelope encode/decode + message bytes (no crypto) | Vault DEK, node:crypto, host I/O |
 | `rtc-duplex.ts` | ~20-line `TDuplex` over `RTCDataChannel` (DOM or werift) | Mux / payload schemas / auth |
-| `rtc-auth.ts` | Pure fingerprint-binding shapes + SDP helpers; hosts supply seal/open | Crypto implementations, signaling |
+| `rtc-auth.ts` | Pure fingerprint binding, ICE-server, and SCTP payload-cap helpers; hosts supply seal/open | Crypto implementations, signaling |
+| `rtc-ice.ts` | Daemon-side mDNS ICE-candidate preflight for werift | RTC signaling, mux, or payload schemas |
 
 ## Wire contract
 
-Every WebSocket binary **message is exactly one mux frame**. The frozen header
-is nine bytes, big-endian: `type(u8) | stream_id(u32) | length(u32)`, followed
-by exactly `length` payload bytes. The relay validates only this header and
-forwards the original bytes; there is no byte-stream reassembly.
+Every **bare mux message** is exactly one mux frame. The frozen header is nine
+bytes, big-endian: `type(u8) | stream_id(u32) | length(u32)`, followed by
+exactly `length` payload bytes. Relay-WebSocket messages prepend the 16-byte
+`mux2` channel envelope; the relay validates the envelope and its one mux frame,
+then forwards the original enveloped bytes. RTC carries the bare mux frame.
+There is no byte-stream reassembly.
 
 OPEN, CTRL, and RESET use UTF-8 JSON in P1. DATA is opaque bytes. END has an
 empty payload. WINDOW is exactly one u32 big-endian delta. Numeric constants
@@ -35,19 +39,18 @@ have one home in `codec.ts`:
 ## Relay blindness
 
 The relay authorizes a channel at setup, then routes binary messages by the
-nine-byte frame inspection only (never `mux.ts`, JSON, stream kinds, or flow
-control). Application payloads and stream state stay endpoint-private.
+16-byte envelope and nine-byte frame inspection only (the codec-only
+`@openllmsh/tunnel/channel-envelope` and `@openllmsh/tunnel/codec` subpaths;
+never `mux.ts`, JSON, stream kinds, or flow control). Application payloads and
+stream state stay endpoint-private.
 
-Routing keys on socket identity for a legacy (`mux1`) channel — the ONE channel
-that socket holds. `mux2` peers instead prepend the **channel-id envelope**
+Every relay peer speaks `mux2` and prepends the **channel-id envelope**
 (`channel-envelope.ts`) to every binary message, so a socket can hold several
-channels at once; the relay demuxes by the tag (verifying the sender actually
-owns that channel — the tag is never trusted alone) and re-frames per receiver:
-it strips the envelope for a `mux1` peer and adds it for a `mux2` peer, so a
-`mux2` serving daemon never needs to learn a browser/fleet consumer's caps.
-The frozen mux codec is UNTOUCHED — the envelope wraps whole WebSocket messages,
-not mux frames. RTC data channels are never enveloped (no relay hop — the data
-channel itself is the channel).
+channels at once. The relay demuxes by the tag only after verifying the sender
+owns that channel; it forwards the enveloped message verbatim to the other
+endpoint. The frozen mux codec is untouched — the envelope wraps one complete
+mux WebSocket message, not a mux frame header. RTC data channels are never
+enveloped (no relay hop — the data channel itself is the channel).
 
 ## Landed vs future modules
 
@@ -56,13 +59,14 @@ channel itself is the channel).
 - `device-grant.ts` — seed-gated device-access grant wire format (signed by the
   browser vault; verified by the daemon). Capability negotiation uses
   `seedgate1` from `@openllmsh/protocol`.
-- `rtc-auth.ts` / `rtc-duplex.ts` — WebRTC fingerprint-bound offer/answer shapes
-  and a thin data-channel duplex. Hosts own signaling and crypto: the browser
-  and consuming fleet daemon are offerers, while the serving daemon's `rtc-host`
-  is the answerer. This is the one direct-path stack for browser↔daemon and
-  daemon↔daemon traffic; relay binary mux is the fallback rung when RTC is
-  unavailable (consumers do not use a JSON splice — see
-  `@packages/daemon-relay/ARCHITECTURE.md`).
+- `rtc-auth.ts` / `rtc-duplex.ts` / `rtc-ice.ts` — WebRTC fingerprint-bound
+  offer/answer shapes, ICE-server and SCTP payload-cap helpers, a thin
+  data-channel duplex, and daemon-side mDNS-candidate preflight for werift.
+  Hosts own signaling and crypto: the browser and consuming fleet daemon are
+  offerers, while the serving daemon's `rtc-host` is the answerer. This is the
+  one direct-path stack for browser↔daemon and daemon↔daemon traffic; relay
+  binary mux is the fallback rung when RTC is unavailable (consumers do not use
+  a JSON splice — see `@packages/daemon-relay/ARCHITECTURE.md`).
 
 **Still future (not present in this package):**
 
