@@ -33,10 +33,15 @@ const resetCode = (payload: Uint8Array): TStreamResetCode | null => {
   return decoded?.code ?? null;
 };
 
-const unknownReset = (payload: Uint8Array): StreamResetError => {
+/**
+ * Classify a RESET payload. Empty / unparseable bytes are expected peer or
+ * channel teardown (`peer_gone`), never a default `protocol_error` — abrupt
+ * mux/RTC close mass-resets live streams with `new Uint8Array()`.
+ */
+export const unknownReset = (payload: Uint8Array): StreamResetError => {
   const parsed = parseStreamResetPayload(decodeJsonPayload(payload));
   return new StreamResetError(
-    parsed?.code ?? "protocol_error",
+    parsed?.code ?? "peer_gone",
     parsed?.message ?? parsed?.code ?? "stream reset",
   );
 };
@@ -350,7 +355,7 @@ export const sessionStream = (
       settleReject(new StreamResetError("timeout", "session open timed out"));
     };
     const offReset = stream.onReset((payload) => {
-      const code = resetCode(payload) ?? "protocol_error";
+      const code = resetCode(payload) ?? "peer_gone";
       finish(code);
       settleReject(unknownReset(payload));
     });
