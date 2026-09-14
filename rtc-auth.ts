@@ -1,5 +1,5 @@
 /**
- * Pure RTC fingerprint-binding helpers for the browser⇄daemon data channel.
+ * Pure RTC fingerprint-binding helpers for client⇄daemon data channels.
  *
  * Trust root: the daemon's long-lived X25519 public key (published on
  * DaemonStatus, pinned by the browser via the cloud status path). The relay
@@ -19,9 +19,9 @@
  *      SDP — only then completes DTLS / marks the channel open.
  *
  * Offer-inner versions:
- *   - v1 `{v:1, n, fb, epk}` — legacy, accepted only when the daemon is
- *     un-provisioned for seed-gated device access.
- *   - v2 `{v:2, n, fb, epk, grant}` — nested full device-grant envelope
+ *   - v1 `{v:1, n, fb, epk}` — legacy codec compatibility only; seed-gated
+ *     RTC hosts reject v1, including when unprovisioned.
+ *   - v2 `{v:2, n, fb, epk, grant, client?}` — nested full device-grant envelope
  *     (base64 from `encodeDeviceGrant`). Reuses standard grant validation
  *     (ts window, nonce, key_id, cid, aud, sig); the sealed box already
  *     binds fb/epk so the grant itself stays the plain device-grant shape
@@ -200,6 +200,16 @@ export type TRtcOfferInnerV1 = {
  * string (base64 JSON). Nested rather than flat sig fields so the daemon
  * reuses `checkDeviceGrant` (ts window, nonce LRU, key_id/cid/aud/sig)
  * without a parallel validation path.
+ *
+ * A script obtains a vault-minted device grant through the existing unlocked
+ * vault flow: key_id targets the daemon API key, cid is the offer channel_id,
+ * and aud is the daemon's pinned X25519 public key. Seal a v2 inner with this
+ * grant, the client's DTLS fingerprint and ephemeral reply key, and client:
+ * "cli" to that daemon key; send it as rtc_offer.fingerprint_proof with the
+ * SDP over the authenticated control channel. Verify the sealed answer's
+ * nonce and both SDP fingerprints before using the rtc1 mux data channel.
+ * The client label is descriptive only and never changes grant enforcement
+ * or mux/session writer ownership. Old v2 offers default to "browser".
  */
 export type TRtcOfferInnerV2 = {
   readonly v: typeof RTC_AUTH_VERSION_2;
@@ -208,6 +218,7 @@ export type TRtcOfferInnerV2 = {
   readonly epk: string;
   /** Full device-grant envelope (base64). */
   readonly grant: string;
+  readonly client?: "browser" | "cli" | "mcp" | "other";
 };
 
 export type TRtcOfferInner = TRtcOfferInnerV1 | TRtcOfferInnerV2;
@@ -359,6 +370,7 @@ export const encodeOfferInner = (inner: TRtcOfferInner): string => {
       fb: normalizeFingerprint(inner.fb),
       epk: inner.epk,
       grant: inner.grant,
+      client: inner.client ?? "browser",
     });
   }
   return JSON.stringify({
@@ -383,12 +395,22 @@ export const decodeOfferInner = (json: string): TRtcOfferInner | null => {
     }
     if (o.v === RTC_AUTH_VERSION_2) {
       if (!isNonEmptyString(o.grant)) return null;
+      const client = o.client === undefined ? "browser" : o.client;
+      if (
+        client !== "browser" &&
+        client !== "cli" &&
+        client !== "mcp" &&
+        client !== "other"
+      ) {
+        return null;
+      }
       return {
         v: RTC_AUTH_VERSION_2,
         n: o.n,
         fb: normalizeFingerprint(o.fb),
         epk: o.epk,
         grant: o.grant,
+        client,
       };
     }
     if (o.v !== RTC_AUTH_VERSION) return null;
