@@ -1,5 +1,11 @@
 import type {
   TDeviceSessionCli,
+  TRealtimeClientEvent,
+  TRealtimeModel,
+  TRealtimeProvider,
+  TRealtimeServerEvent,
+  TRealtimeStreamOpenPayload,
+  TRealtimeVoice,
   TSessionStreamOpenPayload,
   TStreamResetCode,
   TTunnelForwardHeaders,
@@ -8,10 +14,17 @@ import type {
   TTunnelSurface,
 } from "@openllmsh/protocol";
 import {
+  decodeRealtimeLine,
+  encodeRealtimeEventLine,
+  parseRealtimeServerEvent,
   parseStreamCtrlPayload,
   parseStreamOpenPayload,
   parseStreamResetPayload,
+  REALTIME_HEARTBEAT_INTERVAL_MS,
+  REALTIME_HEARTBEAT_TIMEOUT_MS,
+  REALTIME_SESSION_MAX_LIFETIME_MS,
   StreamResetCode,
+  splitRealtimeLines,
   TUNNEL_MEDIA_MAX_BODY_BYTES,
 } from "@openllmsh/protocol";
 import { Schema } from "effect";
@@ -506,6 +519,240 @@ export const sessionStream = (
   });
 };
 
+/**
+ * Wrap a mux stream's DATA channel as an NDJSON realtime-event pump: each
+ * inbound chunk is split on `\n` (carrying a remainder across calls), every
+ * complete line is decoded + schema-validated by `parse`, and mux receive
+ * credit is replenished immediately (events are consumed synchronously here,
+ * never deferred). An oversized/never-terminated line calls `onOverflow`
+ * instead of growing the buffer — the caller decides how to RESET.
+ *
+ * Shared by the CONSUMER side (`realtimeStream` below) and the SERVING side
+ * (a daemon's `kind:"realtime"` dispatch), so both directions get the same
+ * framing and the same bounded-line behavior.
+ */
+export const pumpRealtimeEvents = <T>(
+  stream: TMuxStream,
+  parse: (value: unknown) => T | null,
+  onEvent: (event: T) => void,
+  onOverflow: () => void,
+): (() => void) => {
+  let remainder: Uint8Array = new Uint8Array(0);
+  return stream.onData((bytes) => {
+    const split = splitRealtimeLines(remainder, bytes);
+    if (split === null) {
+      onOverflow();
+      return;
+    }
+    remainder = split.remainder;
+    // Events are decoded + dispatched synchronously in this callback, so
+    // receive credit is safe to replenish immediately (never deferred to a
+    // later `consume()`).
+    stream.consume(bytes.byteLength);
+    for (const line of split.lines) {
+      if (line.byteLength === 0) continue;
+      const decoded = decodeRealtimeLine(line);
+      const event = decoded === undefined ? null : parse(decoded);
+      if (event !== null) onEvent(event);
+    }
+    return false;
+  });
+};
+
+/** A single realtime event, JSON-encoded + newline-terminated, written to the
+ *  stream's DATA channel. Returns the underlying `write()` promise so a
+ *  SERVING-side caller can track backpressure (a CONSUMER-side caller may
+ *  ignore it — `realtimeStream`'s `send` does). Silently drops an event that
+ *  fails to encode (oversized/non-serializable) rather than desyncing the
+ *  NDJSON framing with a truncated line. */
+export const sendRealtimeEvent = (
+  stream: TMuxStream,
+  event: unknown,
+): Promise<void> => {
+  const line = encodeRealtimeEventLine(event);
+  if (line === null) return Promise.resolve();
+  return stream.write(line).catch(() => {});
+};
+
+export type TRealtimeStreamOptions = {
+  readonly provider: TRealtimeProvider;
+  readonly model: TRealtimeModel;
+  readonly voice: TRealtimeVoice;
+  readonly signal?: AbortSignal;
+  /** Test/override seams — production defaults to the shared protocol bounds. */
+  readonly heartbeatIntervalMs?: number;
+  readonly heartbeatTimeoutMs?: number;
+  readonly maxLifetimeMs?: number;
+};
+
+export type TRealtimeStreamResult = {
+  readonly send: (event: TRealtimeClientEvent) => void;
+  readonly onServerEvent: (
+    handler: (event: TRealtimeServerEvent) => void,
+  ) => () => void;
+  readonly close: () => void;
+  readonly closed: Promise<TStreamResetCode | "done">;
+};
+
+/**
+ * Open a realtime duplex session over a mux channel (the browser/fleet
+ * CONSUMER side). Resolves once the serving daemon acks (`open_ack`);
+ * rejects with the nack code/message when refused (`realtime_refused`,
+ * `realtime_busy`, `realtime_unsupported`).
+ *
+ * Events ride NDJSON-framed over the stream's flow-controlled DATA channel
+ * (real mux backpressure, unlike CTRL) via `pumpRealtimeEvents` /
+ * `sendRealtimeEvent`. A `{t:"heartbeat"}` CTRL keeps the session alive
+ * through natural silence; missing ALL inbound traffic for
+ * `heartbeatTimeoutMs`, or exceeding `maxLifetimeMs` total, RESETs with
+ * `timeout`. Callers MUST check `hasRealtimeDuplexCap` on the peer's
+ * capabilities before calling this — an old peer that doesn't understand
+ * `kind:"realtime"` should never receive the OPEN in the first place.
+ */
+export const realtimeStream = (
+  channel: TMuxChannel,
+  options: TRealtimeStreamOptions,
+): Promise<TRealtimeStreamResult> => {
+  const stream = channel.openStream(
+    encodeJsonPayload({
+      kind: "realtime",
+      provider: options.provider,
+      model: options.model,
+      voice: options.voice,
+    }),
+  );
+  const heartbeatIntervalMs =
+    options.heartbeatIntervalMs ?? REALTIME_HEARTBEAT_INTERVAL_MS;
+  const heartbeatTimeoutMs =
+    options.heartbeatTimeoutMs ?? REALTIME_HEARTBEAT_TIMEOUT_MS;
+  const maxLifetimeMs =
+    options.maxLifetimeMs ?? REALTIME_SESSION_MAX_LIFETIME_MS;
+
+  const serverEventHandlers = new Set<(event: TRealtimeServerEvent) => void>();
+  let resolveClosed: (result: TStreamResetCode | "done") => void = () => {};
+  const closed = new Promise<TStreamResetCode | "done">((resolve) => {
+    resolveClosed = resolve;
+  });
+  let closedResult = false;
+  const finish = (result: TStreamResetCode | "done"): void => {
+    if (closedResult) return;
+    closedResult = true;
+    resolveClosed(result);
+  };
+
+  let lastInboundAt = Date.now();
+  let heartbeatTimer: ReturnType<typeof setInterval> | undefined;
+  let lifetimeTimer: ReturnType<typeof setTimeout> | undefined;
+  const stopTimers = (): void => {
+    if (heartbeatTimer !== undefined) clearInterval(heartbeatTimer);
+    if (lifetimeTimer !== undefined) clearTimeout(lifetimeTimer);
+    heartbeatTimer = undefined;
+    lifetimeTimer = undefined;
+  };
+
+  return new Promise<TRealtimeStreamResult>((resolve, reject) => {
+    let settled = false;
+    const settleReject = (error: Error): void => {
+      if (settled) return;
+      settled = true;
+      options.signal?.removeEventListener("abort", onAbort);
+      reject(error);
+    };
+    const onAbort = (): void => {
+      stream.reset(streamReset("timeout", "realtime session open timed out"));
+      finish("timeout");
+      settleReject(
+        new StreamResetError("timeout", "realtime session open timed out"),
+      );
+    };
+    const offReset = stream.onReset((payload) => {
+      stopTimers();
+      const code = resetCode(payload) ?? "peer_gone";
+      finish(code);
+      settleReject(unknownReset(payload));
+    });
+    const offEnd = stream.onEnd(() => {
+      stopTimers();
+      finish("done");
+    });
+    const offData = pumpRealtimeEvents(
+      stream,
+      parseRealtimeServerEvent,
+      (event) => {
+        lastInboundAt = Date.now();
+        for (const handler of serverEventHandlers) handler(event);
+      },
+      () =>
+        stream.reset(streamReset("lagging", "realtime event line too large")),
+    );
+    const offCtrl = stream.onCtrl((payload) => {
+      const ctrl = parseStreamCtrlPayload(decodeJsonPayload(payload));
+      if (ctrl === null) return;
+      if (ctrl.t === "heartbeat") {
+        lastInboundAt = Date.now();
+        return;
+      }
+      if (ctrl.t !== "open_ack" || settled) return;
+      if (!ctrl.ok) {
+        const detail =
+          (typeof ctrl.message === "string" && ctrl.message.length > 0
+            ? ctrl.message
+            : undefined) ??
+          (typeof ctrl.error === "string" && ctrl.error.length > 0
+            ? ctrl.error
+            : undefined) ??
+          "realtime session refused";
+        const nackCode = isStreamResetCode(ctrl.error)
+          ? ctrl.error
+          : "protocol_error";
+        settleReject(new StreamResetError(nackCode, detail));
+        stream.reset(streamReset("protocol_error", detail));
+        finish("protocol_error");
+        return;
+      }
+      settled = true;
+      lastInboundAt = Date.now();
+      options.signal?.removeEventListener("abort", onAbort);
+      lifetimeTimer = setTimeout(() => {
+        stream.reset(
+          streamReset("timeout", "realtime session max lifetime reached"),
+        );
+      }, maxLifetimeMs);
+      heartbeatTimer = setInterval(() => {
+        if (Date.now() - lastInboundAt > heartbeatTimeoutMs) {
+          stream.reset(streamReset("timeout", "realtime heartbeat timed out"));
+          return;
+        }
+        stream.sendCtrl(encodeJsonPayload({ t: "heartbeat" }));
+      }, heartbeatIntervalMs);
+      resolve({
+        send: (event) => {
+          void sendRealtimeEvent(stream, event);
+        },
+        onServerEvent: (handler) => {
+          serverEventHandlers.add(handler);
+          return () => serverEventHandlers.delete(handler);
+        },
+        close: () => {
+          stopTimers();
+          stream.end();
+          finish("done");
+        },
+        closed,
+      });
+    });
+    if (options.signal?.aborted) {
+      onAbort();
+    } else {
+      options.signal?.addEventListener("abort", onAbort, { once: true });
+    }
+    void offReset;
+    void offEnd;
+    void offData;
+    void offCtrl;
+  });
+};
+
 export type TServeTunnelResponse = {
   readonly status: number;
   readonly headers?: TTunnelResponseHeaders;
@@ -525,9 +772,21 @@ export type TServeSession = (
   open: TSessionStreamOpenPayload,
 ) => void | Promise<void>;
 
+/** Serving-side `kind:"realtime"` dispatch — given the raw stream, the
+ *  handler owns admission (nack via `stream.reset`), the `open_ack` CTRL,
+ *  and pumping events both ways (typically via `pumpRealtimeEvents` /
+ *  `sendRealtimeEvent`). Mirrors `TServeSession`'s shape: unlike
+ *  `TServeTunnel` (one request/response), a realtime session is long-lived
+ *  and duplex. */
+export type TServeRealtime = (
+  stream: TMuxStream,
+  open: TRealtimeStreamOpenPayload,
+) => void | Promise<void>;
+
 export type TServeStreamsOptions = {
   readonly tunnel: TServeTunnel;
   readonly session?: TServeSession;
+  readonly realtime?: TServeRealtime;
   /** Reject a valid tunnel OPEN before dispatch, using host-specific wire semantics. */
   readonly admitTunnel?: (
     open: TTunnelStreamOpenPayload,
@@ -618,6 +877,17 @@ export const serveStream =
       // Defer invoke so both sync throws and rejected promises hit the same
       // catch (Promise.resolve(fn()) does not catch sync throws from fn).
       const dispatch = options.session;
+      void (async () => dispatch(stream, open))().catch(() => {
+        stream.reset(streamReset("dispatch_failed"));
+      });
+      return;
+    }
+    if (open.kind === "realtime") {
+      if (options.realtime === undefined) {
+        stream.reset(streamReset("realtime_unsupported"));
+        return;
+      }
+      const dispatch = options.realtime;
       void (async () => dispatch(stream, open))().catch(() => {
         stream.reset(streamReset("dispatch_failed"));
       });
