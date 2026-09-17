@@ -12,6 +12,7 @@ import {
   parseStreamOpenPayload,
   parseStreamResetPayload,
   StreamResetCode,
+  TUNNEL_MEDIA_MAX_BODY_BYTES,
 } from "@openllmsh/protocol";
 import { Schema } from "effect";
 import {
@@ -24,6 +25,72 @@ import { StreamResetError } from "./stream-reset-error";
 
 /** Default wait for the serving end's `res_head` CTRL (matches legacy tunnel). */
 export const TUNNEL_RESPONSE_HEAD_TIMEOUT_MS = 120_000;
+
+export { TUNNEL_MEDIA_MAX_BODY_BYTES };
+
+/**
+ * Concatenate a request body under a hard byte cap. Honors abort. Used when
+ * FormData/Blob must become mux DATA frames without UTF-8 round-trips.
+ */
+export const collectBoundedBytes = async (
+  body: ReadableStream<Uint8Array> | Uint8Array | null,
+  maxBytes: number = TUNNEL_MEDIA_MAX_BODY_BYTES,
+  signal?: AbortSignal,
+): Promise<Uint8Array> => {
+  if (body === null) return new Uint8Array();
+  if (body instanceof Uint8Array) {
+    if (body.byteLength > maxBytes) {
+      throw new Error("tunnel request body too large");
+    }
+    return body;
+  }
+  const reader = body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  const onAbort = (): void => {
+    void reader.cancel().catch(() => {});
+  };
+  if (signal?.aborted) {
+    onAbort();
+    reader.releaseLock();
+    throw new DOMException("Aborted", "AbortError");
+  }
+  signal?.addEventListener("abort", onAbort, { once: true });
+  try {
+    for (;;) {
+      if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
+      const next = await reader.read();
+      if (next.done) {
+        // `onAbort`'s `reader.cancel()` resolves a PENDING read as done —
+        // indistinguishable from a natural end of stream unless we re-check
+        // here. Without this, an abort racing an in-flight `read()` silently
+        // returns the bytes collected so far instead of rejecting.
+        if (signal?.aborted) throw new DOMException("Aborted", "AbortError");
+        break;
+      }
+      total += next.value.byteLength;
+      if (total > maxBytes) {
+        throw new Error("tunnel request body too large");
+      }
+      chunks.push(next.value);
+    }
+  } finally {
+    signal?.removeEventListener("abort", onAbort);
+    reader.releaseLock();
+  }
+  if (chunks.length === 0) return new Uint8Array();
+  if (chunks.length === 1) {
+    const only = chunks[0];
+    return only === undefined ? new Uint8Array() : only;
+  }
+  const out = new Uint8Array(total);
+  let offset = 0;
+  for (const chunk of chunks) {
+    out.set(chunk, offset);
+    offset += chunk.byteLength;
+  }
+  return out;
+};
 
 const streamReset = (code: TStreamResetCode, message?: string): Uint8Array =>
   encodeJsonPayload({ code, ...(message === undefined ? {} : { message }) });
