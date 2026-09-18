@@ -16,6 +16,9 @@ import type {
 import {
   decodeRealtimeLine,
   encodeRealtimeEventLine,
+  MEDIA_PERSISTENCE_BROWSER,
+  MEDIA_PERSISTENCE_RESPONSE_HEADER,
+  MEDIA_URL_RESPONSE_HEADER,
   parseRealtimeServerEvent,
   parseStreamCtrlPayload,
   parseStreamOpenPayload,
@@ -375,6 +378,15 @@ export const tunnelStream = (
       const ctrl = parseStreamCtrlPayload(decodeJsonPayload(payload));
       if (ctrl?.t !== "res_head") return;
       const headers = new Headers();
+      if (ctrl.res_headers?.media_url !== undefined) {
+        headers.set(MEDIA_URL_RESPONSE_HEADER, ctrl.res_headers.media_url);
+      }
+      if (ctrl.res_headers?.media_persistence === MEDIA_PERSISTENCE_BROWSER) {
+        headers.set(
+          MEDIA_PERSISTENCE_RESPONSE_HEADER,
+          MEDIA_PERSISTENCE_BROWSER,
+        );
+      }
       if (ctrl.res_headers?.content_type !== undefined) {
         headers.set("content-type", ctrl.res_headers.content_type);
       }
