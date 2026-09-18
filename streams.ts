@@ -130,6 +130,54 @@ const isStreamResetCode = (value: unknown): value is TStreamResetCode =>
   Schema.is(StreamResetCode)(value);
 
 /**
+ * True when an `AbortSignal`'s `.reason` is TIMEOUT-shaped rather than a
+ * genuine caller cancellation — mirrors the `name`/message heuristic
+ * `packages/daemon/src/net-error.ts`'s `classifyOriginThrow` already uses
+ * for origin-fetch failures (kept as a small local copy, not an import: the
+ * dependency graph is `daemon → tunnel`, never the reverse). Recognizes
+ * `AbortSignal.timeout(ms)`'s own `TimeoutError`-named reason, so a signal
+ * built as `AbortSignal.any([callerSignal, AbortSignal.timeout(ms)])` — the
+ * shape `openRealtimeVoiceOverMux`'s per-rung budget uses — still resolves
+ * correctly to "timeout" when the internal timer is what actually fired,
+ * even though `realtimeStream` only ever sees the ONE merged signal.
+ */
+const isTimeoutAbortReason = (reason: unknown): boolean => {
+  if (typeof reason !== "object" || reason === null) return false;
+  const name = (reason as { name?: unknown }).name;
+  if (name === "TimeoutError") return true;
+  if (name === "AbortError") {
+    const message = (reason as { message?: unknown }).message;
+    const lower = typeof message === "string" ? message.toLowerCase() : "";
+    return lower.includes("timeout") || lower.includes("timed out");
+  }
+  return false;
+};
+
+/**
+ * Build the rejection for a genuine caller-driven abort (NOT a
+ * timeout-shaped reason — see {@link isTimeoutAbortReason}), carrying the
+ * ORIGINAL abort reason when the signal provides one. This is what lets a
+ * caller — or a retry policy like `openOverMuxLadder` — tell "I cancelled
+ * this" apart from "this genuinely timed out" instead of both surfacing as
+ * an identical `StreamResetError("timeout", ...)`.
+ */
+const callerAbortError = (signal: AbortSignal | undefined): Error => {
+  const reason: unknown = signal?.reason;
+  if (reason instanceof Error) return reason;
+  if (typeof reason === "object" && reason !== null) {
+    const message = (reason as { message?: unknown }).message;
+    const name = (reason as { name?: unknown }).name;
+    if (typeof message === "string") {
+      return new DOMException(
+        message,
+        typeof name === "string" ? name : "AbortError",
+      );
+    }
+  }
+  return new DOMException("Aborted", "AbortError");
+};
+
+/**
  * Mirror a mux stream as a ReadableStream. Cancelling a response body RESETs
  * the remote stream so the peer can abort its work. Request-body cancellation
  * only detaches the local reader: the peer may already have sent a response.
@@ -579,6 +627,15 @@ export type TRealtimeStreamOptions = {
   readonly model: TRealtimeModel;
   readonly voice: TRealtimeVoice;
   readonly signal?: AbortSignal;
+  /**
+   * Max wait for the serving end's `open_ack` CTRL before rejecting and
+   * RESETing the stream with `timeout`. Defaults to
+   * {@link TUNNEL_RESPONSE_HEAD_TIMEOUT_MS} — mirrors `tunnelStream`'s own
+   * `headTimeoutMs` default and, like it, applies UNCONDITIONALLY: an
+   * absent `options.signal` must not leave a peer that never acks hanging
+   * forever.
+   */
+  readonly headTimeoutMs?: number;
   /** Test/override seams — production defaults to the shared protocol bounds. */
   readonly heartbeatIntervalMs?: number;
   readonly heartbeatTimeoutMs?: number;
@@ -627,6 +684,8 @@ export const realtimeStream = (
     options.heartbeatTimeoutMs ?? REALTIME_HEARTBEAT_TIMEOUT_MS;
   const maxLifetimeMs =
     options.maxLifetimeMs ?? REALTIME_SESSION_MAX_LIFETIME_MS;
+  const headTimeoutMs =
+    options.headTimeoutMs ?? TUNNEL_RESPONSE_HEAD_TIMEOUT_MS;
 
   const serverEventHandlers = new Set<(event: TRealtimeServerEvent) => void>();
   let resolveClosed: (result: TStreamResetCode | "done") => void = () => {};
@@ -655,16 +714,55 @@ export const realtimeStream = (
     const settleReject = (error: Error): void => {
       if (settled) return;
       settled = true;
+      clearTimeout(headTimer);
       options.signal?.removeEventListener("abort", onAbort);
       reject(error);
     };
     const onAbort = (): void => {
+      // `options.signal` may itself be a MERGED signal (e.g. the mux ladder's
+      // `AbortSignal.any([callerSignal, AbortSignal.timeout(rungBudgetMs)])`)
+      // — a timeout-shaped reason keeps producing the exact same
+      // `StreamResetError("timeout", ...)` as before (so `isTransportFailure`
+      // keeps treating it as retryable and rung failover is unaffected), but
+      // any OTHER reason is a genuine caller cancellation and must reject as
+      // a distinguishable AbortError, never mislabeled as a timeout.
+      //
+      // Settle FIRST, exactly like `tunnelStream`'s own `onAbort` — a
+      // `stream.reset()` below can synchronously fire this SAME stream's
+      // local `onReset` handler, which would otherwise overwrite the
+      // AbortError / distinguishing timeout rejection below with a generic
+      // `unknownReset(payload)` (`settleReject` is a no-op once `settled`).
+      if (isTimeoutAbortReason(options.signal?.reason)) {
+        finish("timeout");
+        settleReject(
+          new StreamResetError("timeout", "realtime session open timed out"),
+        );
+        stream.reset(streamReset("timeout", "realtime session open timed out"));
+        return;
+      }
+      // No dedicated "cancelled" code exists in the closed `StreamResetCode`
+      // wire vocabulary (adding one is a protocol change, out of scope here)
+      // — "timeout" is still the peer-facing teardown signal, but the LOCAL
+      // rejection below (what `openOverMuxLadder`/callers actually observe)
+      // is a real AbortError carrying the original abort reason, so it can
+      // never be confused with a genuine internal timeout.
+      finish("timeout");
+      settleReject(callerAbortError(options.signal));
+      stream.reset(
+        streamReset("timeout", "realtime session aborted by caller"),
+      );
+    };
+    // Handshake budget, independent of `options.signal`: a caller that opens
+    // with no signal at all (or one that never fires) must not wait forever
+    // on a peer that swallows the OPEN and never sends `open_ack` — mirrors
+    // `tunnelStream`'s own unconditional `headTimer`.
+    const headTimer = setTimeout(() => {
       stream.reset(streamReset("timeout", "realtime session open timed out"));
       finish("timeout");
       settleReject(
         new StreamResetError("timeout", "realtime session open timed out"),
       );
-    };
+    }, headTimeoutMs);
     const offReset = stream.onReset((payload) => {
       stopTimers();
       const code = resetCode(payload) ?? "peer_gone";
@@ -674,6 +772,13 @@ export const realtimeStream = (
     const offEnd = stream.onEnd(() => {
       stopTimers();
       finish("done");
+      // A stream that ends before `open_ack` ever arrived must REJECT the
+      // opening promise, not leave it pending forever — `settleReject` is a
+      // no-op once `open_ack` already resolved it, so this is safe to call
+      // unconditionally on every END.
+      settleReject(
+        new StreamResetError("peer_gone", "stream ended before open_ack"),
+      );
     });
     const offData = pumpRealtimeEvents(
       stream,
@@ -711,6 +816,7 @@ export const realtimeStream = (
         return;
       }
       settled = true;
+      clearTimeout(headTimer);
       lastInboundAt = Date.now();
       options.signal?.removeEventListener("abort", onAbort);
       lifetimeTimer = setTimeout(() => {
