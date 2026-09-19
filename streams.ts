@@ -783,9 +783,14 @@ export const realtimeStream = (
     });
     const offData = pumpRealtimeEvents(
       stream,
-      parseRealtimeServerEvent,
-      (event) => {
+      (value) => {
+        // Any successfully decoded JSON line is inbound traffic — refresh
+        // BEFORE schema parse so unrecognized vendor events still keep the
+        // heartbeat alive. Silence (no DATA / CTRL) still times out.
         lastInboundAt = Date.now();
+        return parseRealtimeServerEvent(value);
+      },
+      (event) => {
         for (const handler of serverEventHandlers) handler(event);
       },
       () =>
