@@ -71,6 +71,16 @@ export type TCreateChannelOptions = {
    * Defaults to 256.
    */
   readonly maxStreams?: number;
+  /**
+   * Per-stream cap on unsent queued DATA bytes (DSN-1). A peer that never
+   * replenishes its receive window would otherwise let `stream.write`
+   * promises queue without bound (a fast PTY against a stalled browser grew
+   * RSS past 1 GB). When a write would exceed the cap the stream is reset
+   * with reason `backpressure_exceeded` and the write rejects. Finite values
+   * below 1 clamp to 1; undefined / non-finite fall back to the default.
+   * Defaults to 4 MiB.
+   */
+  readonly maxPendingBytes?: number;
 };
 
 type TPendingWrite = {
@@ -87,6 +97,8 @@ type TStreamState = {
   readonly resetHandlers: Set<TMuxEventHandler>;
   readonly ctrlHandlers: Set<TMuxEventHandler>;
   readonly pending: TPendingWrite[];
+  /** Unsent bytes across {@link pending} — bounded by `maxPendingBytes`. */
+  pendingBytes: number;
   sendCredit: number;
   receiveCredit: number;
   receivedUnconsumed: number;
@@ -166,6 +178,14 @@ export const createChannel = (options: TCreateChannelOptions): TMuxChannel => {
     return floored;
   })();
 
+  const maxPendingBytes = (() => {
+    const requested = options.maxPendingBytes;
+    if (requested === undefined || !Number.isFinite(requested))
+      return 4 * 1024 * 1024;
+    const floored = Math.floor(requested);
+    return floored < 1 ? 1 : floored;
+  })();
+
   const sendResetForExcessOpen = (streamId: number): void => {
     send(FRAME_TYPE.reset, streamId, new Uint8Array());
   };
@@ -193,6 +213,7 @@ export const createChannel = (options: TCreateChannelOptions): TMuxChannel => {
     for (const pending of state.pending.splice(0)) {
       pending.reject(resetError(payload));
     }
+    state.pendingBytes = 0;
     retireStreamState(state);
     emit(state.resetHandlers, (handler) =>
       handler(payload ?? new Uint8Array()),
@@ -255,6 +276,7 @@ export const createChannel = (options: TCreateChannelOptions): TMuxChannel => {
       send(FRAME_TYPE.data, state.id, chunk);
       pending.offset += size;
       state.sendCredit -= size;
+      state.pendingBytes -= size;
       if (pending.offset === pending.bytes.byteLength) {
         state.pending.shift();
         pending.resolve();
@@ -270,6 +292,7 @@ export const createChannel = (options: TCreateChannelOptions): TMuxChannel => {
     resetHandlers: new Set(),
     ctrlHandlers: new Set(),
     pending: [],
+    pendingBytes: 0,
     sendCredit: INITIAL_STREAM_WINDOW_BYTES,
     receiveCredit: INITIAL_STREAM_WINDOW_BYTES,
     receivedUnconsumed: 0,
@@ -292,10 +315,22 @@ export const createChannel = (options: TCreateChannelOptions): TMuxChannel => {
           return Promise.reject(new Error("stream is closed"));
         if (bytes.byteLength === 0) return Promise.resolve();
         const queued = new Uint8Array(bytes);
-        return new Promise<void>((resolve, reject) => {
+        const promise = new Promise<void>((resolve, reject) => {
           state.pending.push({ bytes: queued, offset: 0, resolve, reject });
-          drain(state);
         });
+        state.pendingBytes += queued.byteLength;
+        // DSN-1: a peer that stops sending window updates must not let this
+        // queue grow without bound. Bytes that fit the open window drain
+        // immediately; the cap bounds only the UNSENT remainder. When it is
+        // exceeded the stream resets with a clear reason and every queued
+        // write rejects instead of retaining unbounded memory.
+        drain(state);
+        if (state.pendingBytes > maxPendingBytes) {
+          const reason = new TextEncoder().encode("backpressure_exceeded");
+          send(FRAME_TYPE.reset, state.id, reason);
+          localReset(state, reason);
+        }
+        return promise;
       },
       end: () => {
         if (state.localEnded || state.endRequested || state.reset || closed)
