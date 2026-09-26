@@ -22,6 +22,18 @@ export const DEVICE_GRANT_VERSION = 1 as const;
  */
 export const DEVICE_GRANT_TS_WINDOW_MS = 600_000;
 export const DEVICE_GRANT_NONCE_BYTES = 16;
+/**
+ * Hard bound on the verifier's nonce-replay map (`device-access-verify.ts`).
+ * The map keeps one entry per accepted grant for the full acceptance window,
+ * so the cap must scale with the window: the original 4096 was sized for the
+ * 120 s window (~34 distinct valid grants per second sustained). The same
+ * rate over the widened window needs 20 480 — a smaller cap would start
+ * rejecting legitimate grants as `nonce_overload` once 4096 still-valid
+ * nonces are in flight (rework finding). A full map still rejects rather than
+ * evicting unexpired nonces — replay protection never degrades under load.
+ */
+export const DEVICE_GRANT_NONCE_CAP =
+  4096 * Math.ceil(DEVICE_GRANT_TS_WINDOW_MS / 120_000);
 
 export type TDeviceGrantFields = {
   readonly v: 1;
