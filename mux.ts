@@ -75,8 +75,11 @@ export type TCreateChannelOptions = {
    * Per-stream cap on unsent queued DATA bytes (DSN-1). A peer that never
    * replenishes its receive window would otherwise let `stream.write`
    * promises queue without bound (a fast PTY against a stalled browser grew
-   * RSS past 1 GB). When a write would exceed the cap the stream is reset
-   * with reason `backpressure_exceeded` and the write rejects. Finite values
+   * RSS past 1 GB). The cap gates the backlog of EARLIER writes only: one
+   * buffered write larger than the cap (a tunnel body is protocol-bounded at
+   * 20 MiB) still drains at window pace, but a stream whose unsent backlog
+   * already reached the cap refuses the next write — it resets with reason
+   * `backpressure_exceeded` and every queued write rejects. Finite values
    * below 1 clamp to 1; undefined / non-finite fall back to the default.
    * Defaults to 4 MiB.
    */
@@ -314,22 +317,27 @@ export const createChannel = (options: TCreateChannelOptions): TMuxChannel => {
         if (state.reset || closed)
           return Promise.reject(new Error("stream is closed"));
         if (bytes.byteLength === 0) return Promise.resolve();
+        // DSN-1: a peer that stops sending window updates must not let this
+        // queue grow without bound. The cap bounds the UNSENT backlog of
+        // earlier writes, never the write being queued — one buffered body
+        // larger than the cap (tunnel requests run up to the 20 MiB protocol
+        // limit) must drain at window pace instead of resetting the stream.
+        // A backlog that already reached the cap refuses the next write: the
+        // stream resets with a clear reason and every queued write rejects.
+        // Total queued memory stays bounded by `maxPendingBytes` plus one
+        // caller-supplied buffer.
+        if (state.pendingBytes >= maxPendingBytes) {
+          const reason = new TextEncoder().encode("backpressure_exceeded");
+          send(FRAME_TYPE.reset, state.id, reason);
+          localReset(state, reason);
+          return Promise.reject(resetError(reason));
+        }
         const queued = new Uint8Array(bytes);
         const promise = new Promise<void>((resolve, reject) => {
           state.pending.push({ bytes: queued, offset: 0, resolve, reject });
         });
         state.pendingBytes += queued.byteLength;
-        // DSN-1: a peer that stops sending window updates must not let this
-        // queue grow without bound. Bytes that fit the open window drain
-        // immediately; the cap bounds only the UNSENT remainder. When it is
-        // exceeded the stream resets with a clear reason and every queued
-        // write rejects instead of retaining unbounded memory.
         drain(state);
-        if (state.pendingBytes > maxPendingBytes) {
-          const reason = new TextEncoder().encode("backpressure_exceeded");
-          send(FRAME_TYPE.reset, state.id, reason);
-          localReset(state, reason);
-        }
         return promise;
       },
       end: () => {
