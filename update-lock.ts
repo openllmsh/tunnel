@@ -31,12 +31,21 @@
  *     every later writer forever. A lone `owner.json.<nonce>.tmp` still
  *     carries a readable record (a holder that died mid-publish) and is
  *     evaluated the same way.
- *   - Steal = atomic `rename(lockDir, quarantine)` — only ONE racer wins the
- *     rename — then RE-VALIDATE inside quarantine: still-stale or
- *     unproven-past-the-bound → delete; a live owner (released + re-acquired
- *     between our read and the rename, or a publish that landed mid-race —
- *     its fresh record mtime is still inside the bound) → move back with a
- *     no-replace rename.
+ *   - Steal = a sibling `<lockDir>.stealing-<pid>-<nonce>` MARKER is created
+ *     first and stays up for the whole transaction, then an atomic
+ *     `rename(lockDir, quarantine)` — only ONE racer wins the rename — then
+ *     RE-VALIDATE inside quarantine: still-stale or unproven-past-the-bound
+ *     → delete; a live owner (released + re-acquired between our read and
+ *     the rename, or a publish that landed mid-race — its fresh record
+ *     mtime is still inside the bound) → move back with a no-replace
+ *     rename. The marker is what makes the race safe (FSS-14): while it is
+ *     up, a lock dir that vanished under the rename is provably mid-steal,
+ *     and an acquirer that lands an mkdir in the gap sees the marker and
+ *     undoes its own empty dir instead of becoming a second holder.
+ *   - Leftover markers/quarantine dirs from a crashed stealer are adjudicated
+ *     on every acquire pass: a live marker is honored, a dead-pid or aged
+ *     marker is removed, and a stranded quarantine dir is re-validated —
+ *     proven-live restores no-replace, stale deletes.
  *   - Release/cleanup = rename `lockDir` to a unique quarantine name FIRST,
  *     then verify the owner nonce inside quarantine matches ours before
  *     deleting — if it does not, move the dir back (no-replace) and do
@@ -55,13 +64,17 @@ import {
   readdirSync,
   readFileSync,
   renameSync,
+  rmdirSync,
   rmSync,
   statSync,
   writeFileSync,
 } from "node:fs";
-import { join } from "node:path";
+import { basename, dirname, join } from "node:path";
 import type { TProcessStartIdentityReader } from "./session/local-runtime";
-import { processStartIdentity } from "./session/local-runtime";
+import {
+  processIdentityStatus,
+  processStartIdentity,
+} from "./session/local-runtime";
 
 /** The lock dir sits next to the binary being swapped: `<dest>.update.lock`. */
 export const updateLockDirFor = (destPath: string): string =>
@@ -130,6 +143,49 @@ const newNonce = (): string => randomBytes(16).toString("hex");
 /** Unique quarantine name for one steal/release transaction. */
 const quarantinePath = (lockDir: string, tag: string, nonce: string): string =>
   `${lockDir}.${tag}-${process.pid}-${nonce}`;
+
+/**
+ * A sibling dir named `<lock>.stealing-<pid>-<nonce>` marks a steal in
+ * flight (FSS-14). The stealer creates it BEFORE the quarantine rename and
+ * keeps it until the move-back-or-delete decision is final, so the name gap
+ * between `rename(lockDir, quarantine)` and any restore can never admit a
+ * second logical owner: an acquirer whose mkdir lands in the gap sees the
+ * marker and backs out of its own just-made empty dir.
+ */
+const stealMarkerName = (lockDir: string, nonce: string): string =>
+  `${lockDir}.stealing-${process.pid}-${nonce}`;
+
+/** The creator pid embedded in a `<lock>.stealing-<pid>-<nonce>` marker. */
+const stealMarkerPid = (lockDir: string, name: string): number | null => {
+  const prefix = `${basename(lockDir)}.stealing-`;
+  if (!name.startsWith(prefix)) return null;
+  const pid = Number.parseInt(
+    name.slice(prefix.length).split("-")[0] ?? "",
+    10,
+  );
+  return Number.isSafeInteger(pid) && pid > 0 ? pid : null;
+};
+
+/** True while a sibling `.stealing-*` marker exists — a steal is in flight
+ *  and an acquirer must not claim the freed name. */
+const stealInFlight = (lockDir: string): boolean => {
+  let names: string[];
+  try {
+    names = readdirSync(dirname(lockDir));
+  } catch {
+    return false;
+  }
+  return names.some((name) => stealMarkerPid(lockDir, name) !== null);
+};
+
+/** Test seam: runs inside a steal AFTER the quarantine rename, before the
+ *  re-validation — the exact window FSS-14 exploits. */
+let stealGapHookForTests: ((lockDir: string) => void) | null = null;
+export const setUpdateLockStealGapHookForTests = (
+  hook: ((lockDir: string) => void) | null,
+): void => {
+  stealGapHookForTests = hook;
+};
 
 const coerceOwner = (v: unknown): TOwnerRecord | null => {
   if (typeof v !== "object" || v === null) return null;
@@ -216,17 +272,22 @@ const classifyOwner = (
     readonly startIdentity: TProcessStartIdentityReader;
   },
 ): "stale" | "proven-live" | "unproven" => {
-  let start: string | null | undefined;
-  try {
-    start = probes.startIdentity(owner.pid);
-  } catch {
-    start = undefined;
+  if (owner.start === "") {
+    // No recorded identity: liveness alone can only ever prove DEAD — a
+    // live pid with nothing to compare stays unproven so a reused pid can
+    // never inherit the lock.
+    return probes.pidAlive(owner.pid) ? "unproven" : "stale";
   }
-  if (start === null) return "stale"; // confirmed dead
-  if (typeof start === "string" && start.length > 0) {
-    if (owner.start === "") return "unproven"; // live pid, nothing to compare
-    return start === owner.start ? "proven-live" : "stale"; // PID reuse
-  }
+  // processIdentityStatus bridges the RT-1 format change: an old `ps lstart`
+  // record is re-probed with the legacy reader instead of being convicted
+  // by a raw string mismatch against the boot-scoped identity.
+  const status = processIdentityStatus(
+    owner.pid,
+    owner.start,
+    probes.startIdentity,
+  );
+  if (status === "alive") return "proven-live";
+  if (status === "dead") return "stale";
   return probes.pidAlive(owner.pid) ? "unproven" : "stale";
 };
 
@@ -423,6 +484,10 @@ export const tryAcquireUpdateLock = (
 ): TUpdateLockRelease | null => {
   const nonce = newNonce();
   const ours = { nonce, ino: null as number | null };
+  // FSS-14: while a steal marker is up the lock name may be in the
+  // rename gap — an mkdir that lands there must not produce a second
+  // holder, so markers are honored before AND after our mkdir.
+  if (stealInFlight(lockDir)) return null;
   try {
     mkdirSync(lockDir);
   } catch {
@@ -430,6 +495,19 @@ export const tryAcquireUpdateLock = (
   }
   ourNonces.add(nonce);
   ours.ino = dirIno(lockDir);
+  if (stealInFlight(lockDir)) {
+    // Our mkdir landed inside a steal's name gap. Undo ONLY our own dir —
+    // it is still empty (nothing has been published into it) and still
+    // provably ours by inode — then report held.
+    try {
+      if (ours.ino !== null && dirIno(lockDir) === ours.ino) rmdirSync(lockDir);
+    } catch {
+      // A restore raced the dir out from under us; leave it — it is no
+      // longer ours to remove.
+    }
+    ourNonces.delete(nonce);
+    return null;
+  }
   const record: TOwnerRecord = {
     kind: OWNER_KIND,
     pid: process.pid,
@@ -496,27 +574,108 @@ const stealStaleLock = (
   },
   now: () => number,
 ): boolean => {
-  const quarantine = quarantinePath(lockDir, "steal", newNonce());
+  // FSS-14: the marker goes up BEFORE the rename so the name gap between
+  // quarantine and any move-back is provably a steal in flight — a
+  // concurrent mkdir in that window sees the marker and cannot become a
+  // second holder.
+  const nonce = newNonce();
+  const marker = stealMarkerName(lockDir, nonce);
   try {
-    renameSync(lockDir, quarantine);
+    mkdirSync(marker);
   } catch {
-    return false; // already stolen/released by someone else
-  }
-  const owner = readOwner(quarantine);
-  const verdict = owner === null ? "unproven" : classifyOwner(owner, probes);
-  if (
-    verdict === "proven-live" ||
-    (verdict === "unproven" && !reclaimDue(quarantine, now()))
-  ) {
-    moveBackNoReplace(quarantine, lockDir);
-    return false;
+    return false; // another steal (or a stranded marker) is in flight
   }
   try {
-    rmSync(quarantine, { recursive: true, force: true });
-  } catch {
-    // best-effort — a leftover `.steal-*` dir is inert
+    const quarantine = quarantinePath(lockDir, "steal", nonce);
+    try {
+      renameSync(lockDir, quarantine);
+    } catch {
+      return false; // already stolen/released by someone else
+    }
+    stealGapHookForTests?.(lockDir);
+    const owner = readOwner(quarantine);
+    const verdict = owner === null ? "unproven" : classifyOwner(owner, probes);
+    if (
+      verdict === "proven-live" ||
+      (verdict === "unproven" && !reclaimDue(quarantine, now()))
+    ) {
+      moveBackNoReplace(quarantine, lockDir);
+      return false;
+    }
+    try {
+      rmSync(quarantine, { recursive: true, force: true });
+    } catch {
+      // best-effort — a leftover `.steal-*` dir is adjudicated on the next pass
+    }
+    return true;
+  } finally {
+    try {
+      rmdirSync(marker);
+    } catch {
+      // best-effort — a stranded marker is swept once its pid dies or it ages
+    }
   }
-  return true;
+};
+
+/**
+ * Adjudicate steal/release residue a crashed contender left beside
+ * `lockDir` (FSS-14): a `.stealing-<pid>-<nonce>` marker whose creator pid
+ * is dead (or whose age is past the reclaim bound) is removed — a live
+ * marker is still honored. A stranded `.steal-*`/`.rel-*` quarantine dir is
+ * re-validated exactly like a fresh steal: a proven-live owner moves back
+ * when the name is free (and is deleted when a successor already holds the
+ * name — the stranded record is inert), anything stale or unproven past the
+ * bound is deleted, and a fresh unproven dir is left for the next pass.
+ */
+const sweepUpdateLockResidue = (
+  lockDir: string,
+  probes: {
+    readonly pidAlive: (pid: number) => boolean;
+    readonly startIdentity: TProcessStartIdentityReader;
+  },
+  now: () => number,
+): void => {
+  const parent = dirname(lockDir);
+  const base = basename(lockDir);
+  let names: string[];
+  try {
+    names = readdirSync(parent);
+  } catch {
+    return;
+  }
+  for (const name of names) {
+    const markerPid = stealMarkerPid(lockDir, name);
+    if (markerPid !== null) {
+      const path = join(parent, name);
+      try {
+        const aged = now() - statSync(path).mtimeMs > UPDATE_LOCK_RECLAIM_MS;
+        if (aged || !probes.pidAlive(markerPid)) rmdirSync(path);
+      } catch {
+        // raced or non-empty marker — retried on the next pass
+      }
+      continue;
+    }
+    if (!name.startsWith(`${base}.steal-`) && !name.startsWith(`${base}.rel-`))
+      continue;
+    const path = join(parent, name);
+    try {
+      if (!statSync(path).isDirectory()) continue;
+    } catch {
+      continue;
+    }
+    const owner = readOwner(path);
+    const verdict = owner === null ? "unproven" : classifyOwner(owner, probes);
+    if (verdict === "unproven" && !reclaimDue(path, now())) continue;
+    if (verdict === "proven-live" && !existsSync(lockDir)) {
+      moveBackNoReplace(path, lockDir);
+      continue;
+    }
+    try {
+      rmSync(path, { recursive: true, force: true });
+    } catch {
+      // retried on the next pass
+    }
+  }
 };
 
 /**
@@ -548,6 +707,7 @@ export const acquireUpdateLock = async (
   };
   const deadline = now() + waitMs;
   for (;;) {
+    sweepUpdateLockResidue(lockDir, probes, now);
     const release = tryAcquireUpdateLock(lockDir, {
       startIdentity: probes.startIdentity,
     });
