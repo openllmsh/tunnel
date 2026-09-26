@@ -1,0 +1,597 @@
+/**
+ * Cross-process exclusive lock for the CLI binary swap region.
+ *
+ * TWO writers converge on the same `openllm` binary: the daemon's background
+ * CLI converger (`packages/daemon/src/cli-self-update.ts`) and a manual
+ * `openllm self-update` (`packages/cli/src/self-update.ts`). A process-local
+ * `updating` flag can't serialize them — last-writer-wins could interleave
+ * probe → backup → rename → state-marker so `<dest>.prev` ends up unrelated
+ * to the final binary and `state.json` records the OTHER update. This lock is
+ * shared by both binaries (the one place a common implementation can live)
+ * and covers exactly that swap region; the download itself stays outside it.
+ *
+ * Implementation (ownership-proven, never check-then-delete):
+ *
+ *   - `mkdir(lockDir)` is the atomic acquire (EEXIST = held).
+ *   - The holder publishes `owner.json` INSIDE the dir — `{kind, pid, start,
+ *     nonce}` — atomically (pid/nonce-named temp + rename). `start` is the
+ *     exact process-start identity (`processStartIdentity`), so a reused PID
+ *     can't masquerade as the dead process it replaced; `nonce` is a random
+ *     128-bit ownership token that makes every later step verifiable.
+ *   - A record is PROVEN-LIVE only when its pid is alive AND the recorded
+ *     start identity matches the live process at that pid — it is never
+ *     evicted, however old the dir is. A record is STALE when its pid is
+ *     confirmed dead or provably a DIFFERENT process (PID reuse — the
+ *     recorded start identity no longer matches). Anything else — an
+ *     unreadable or unmarked dir, a live pid recorded with an empty start
+ *     (no identity to compare), or an inconclusive probe over a live pid —
+ *     is UNPROVEN: HELD, but reclaimable once the dir has shown no complete
+ *     owner for `UPDATE_LOCK_RECLAIM_MS`, so a crash between mkdir and
+ *     publish (or a holder that can never prove its start) can't wedge
+ *     every later writer forever. A lone `owner.json.<nonce>.tmp` still
+ *     carries a readable record (a holder that died mid-publish) and is
+ *     evaluated the same way.
+ *   - Steal = atomic `rename(lockDir, quarantine)` — only ONE racer wins the
+ *     rename — then RE-VALIDATE inside quarantine: still-stale or
+ *     unproven-past-the-bound → delete; a live owner (released + re-acquired
+ *     between our read and the rename, or a publish that landed mid-race —
+ *     its fresh record mtime is still inside the bound) → move back with a
+ *     no-replace rename.
+ *   - Release/cleanup = rename `lockDir` to a unique quarantine name FIRST,
+ *     then verify the owner nonce inside quarantine matches ours before
+ *     deleting — if it does not, move the dir back (no-replace) and do
+ *     nothing else. The old owner can NEVER delete the new owner's lock.
+ *   - Re-entry (same process acquiring twice) requires pid AND start AND
+ *     nonce to match — each acquisition mints a fresh nonce, so a second
+ *     acquire always fails fast instead of self-deadlocking.
+ *
+ * No flock dependency: this must work identically on macOS and Linux under
+ * both `bun` and the compiled binaries.
+ */
+import { randomBytes } from "node:crypto";
+import {
+  existsSync,
+  mkdirSync,
+  readdirSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
+import { join } from "node:path";
+import type { TProcessStartIdentityReader } from "./session/local-runtime";
+import { processStartIdentity } from "./session/local-runtime";
+
+/** The lock dir sits next to the binary being swapped: `<dest>.update.lock`. */
+export const updateLockDirFor = (destPath: string): string =>
+  `${destPath}.update.lock`;
+
+const OWNER_FILE = "owner.json";
+const OWNER_KIND = "openllm-update-lock/v1";
+
+/** Default time an acquirer waits for a live holder before giving up. */
+export const UPDATE_LOCK_WAIT_MS = 30_000;
+/**
+ * Bounded reclaim horizon. A dir whose only claim is UNPROVEN — unmarked,
+ * unreadable, or a record that can neither be convicted nor proven live —
+ * stays held until this long after its last evidence of a complete owner
+ * (dir mtime / owner record publish time). A PROVEN-live owner is never
+ * reclaimed regardless of age.
+ */
+export const UPDATE_LOCK_RECLAIM_MS = 10 * 60_000;
+const POLL_MS = 250;
+
+/**
+ * The ownership record published in `owner.json`. `start` is the process-start
+ * identity {@link processStartIdentity} reports for `pid` ("" when the owner
+ * couldn't probe itself — such a record can neither convict on PID reuse nor
+ * prove a live pid is the same process, so it lands in UNPROVEN, never
+ * proven-live). `nonce` is the ownership token releases/steals verify.
+ */
+type TOwnerRecord = {
+  readonly kind: typeof OWNER_KIND;
+  readonly pid: number;
+  readonly start: string;
+  readonly nonce: string;
+};
+
+export type TUpdateLockOptions = {
+  /** How long to wait for a live holder before giving up (`null` result). */
+  readonly waitMs?: number;
+  /** Injectable clock for tests. */
+  readonly now?: () => number;
+  /** Injectable sleep for tests. */
+  readonly sleep?: (ms: number) => Promise<void>;
+  /** Injectable liveness probe for tests. */
+  readonly pidAlive?: (pid: number) => boolean;
+  /** Injectable start-identity probe for tests (PID-reuse detection). */
+  readonly startIdentity?: TProcessStartIdentityReader;
+};
+
+/** The release function returned on a successful acquire. */
+export type TUpdateLockRelease = () => void;
+
+/** True when `pid` refers to a live process. `process.kill(pid, 0)`: ESRCH =
+ *  dead, EPERM = alive but owned by another user. Anything else conservatively
+ *  counts as alive so an exotic failure can't trigger a steal. */
+const defaultPidAlive = (pid: number): boolean => {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code !== "ESRCH";
+  }
+};
+
+/** 128-bit random ownership token — fresh per acquisition attempt. */
+const newNonce = (): string => randomBytes(16).toString("hex");
+
+/** Unique quarantine name for one steal/release transaction. */
+const quarantinePath = (lockDir: string, tag: string, nonce: string): string =>
+  `${lockDir}.${tag}-${process.pid}-${nonce}`;
+
+const coerceOwner = (v: unknown): TOwnerRecord | null => {
+  if (typeof v !== "object" || v === null) return null;
+  const o = v as Partial<TOwnerRecord>;
+  if (
+    o.kind !== OWNER_KIND ||
+    !Number.isSafeInteger(o.pid) ||
+    (o.pid as number) <= 0 ||
+    typeof o.start !== "string" ||
+    typeof o.nonce !== "string" ||
+    o.nonce.length === 0
+  ) {
+    return null;
+  }
+  return {
+    kind: OWNER_KIND,
+    pid: o.pid as number,
+    start: o.start,
+    nonce: o.nonce,
+  };
+};
+
+const readOwnerFile = (path: string): TOwnerRecord | null => {
+  try {
+    return coerceOwner(JSON.parse(readFileSync(path, "utf-8")));
+  } catch {
+    return null;
+  }
+};
+
+/** Valid un-published owner records (`owner.json.<nonce>.tmp`) inside a dir. */
+const readTmpOwners = (dir: string): TOwnerRecord[] => {
+  let names: string[];
+  try {
+    names = readdirSync(dir);
+  } catch {
+    return [];
+  }
+  const out: TOwnerRecord[] = [];
+  for (const name of names) {
+    if (!name.startsWith(`${OWNER_FILE}.`) || !name.endsWith(".tmp")) continue;
+    const owner = readOwnerFile(join(dir, name));
+    if (owner !== null) out.push(owner);
+  }
+  return out;
+};
+
+/**
+ * The ownership record a lock dir currently proves — `owner.json` when
+ * published, else the SINGLE readable publish-temp record (a holder that died
+ * mid-publish is still identifiable + stealable). Anything else — an empty
+ * dir, corrupt JSON, multiple conflicting records — is UNMARKED: still HELD
+ * (a mid-setup holder is never evicted outright), but bounded — reclaimable
+ * once the dir has shown no complete owner for `UPDATE_LOCK_RECLAIM_MS`.
+ */
+const readOwner = (dir: string): TOwnerRecord | null => {
+  const published = readOwnerFile(join(dir, OWNER_FILE));
+  if (published !== null) return published;
+  const tmps = readTmpOwners(dir);
+  return tmps.length === 1 ? (tmps[0] ?? null) : null;
+};
+
+/**
+ * Three-way verdict for a recorded owner:
+ *
+ *   - `proven-live` — pid alive AND the recorded start identity matches the
+ *     live process at that pid. A record with an EMPTY `start` can never
+ *     reach this verdict: there is no identity to compare, so liveness alone
+ *     must not prove a live pid — a reused pid would otherwise inherit the
+ *     dead owner's lock forever. Never reclaimed, whatever the dir's age.
+ *   - `stale` — provably gone: confirmed dead, the probe is inconclusive AND
+ *     liveness says dead, or the pid is alive but belongs to a DIFFERENT
+ *     process (PID reuse — the exact start identity no longer matches the
+ *     recorded one).
+ *   - `unproven` — can neither be convicted nor proven: a live pid behind an
+ *     inconclusive probe, or a live pid against an empty recorded start.
+ *     HELD, but eligible for the bounded reclaim — never promoted to
+ *     proven-live by liveness alone.
+ */
+const classifyOwner = (
+  owner: TOwnerRecord,
+  probes: {
+    readonly pidAlive: (pid: number) => boolean;
+    readonly startIdentity: TProcessStartIdentityReader;
+  },
+): "stale" | "proven-live" | "unproven" => {
+  let start: string | null | undefined;
+  try {
+    start = probes.startIdentity(owner.pid);
+  } catch {
+    start = undefined;
+  }
+  if (start === null) return "stale"; // confirmed dead
+  if (typeof start === "string" && start.length > 0) {
+    if (owner.start === "") return "unproven"; // live pid, nothing to compare
+    return start === owner.start ? "proven-live" : "stale"; // PID reuse
+  }
+  return probes.pidAlive(owner.pid) ? "unproven" : "stale";
+};
+
+/**
+ * The newest mtime among `owner.json` and any `owner.json.<nonce>.tmp`
+ * publish temps — the last time the dir gained (or nearly gained) a complete
+ * owner record. Write-then-rename keeps the write's mtime, so a published
+ * record's mtime IS its publish time.
+ */
+const ownerRecordTimeMs = (dir: string): number | null => {
+  let names: string[];
+  try {
+    names = readdirSync(dir);
+  } catch {
+    return null;
+  }
+  let latest: number | null = null;
+  for (const name of names) {
+    if (
+      name !== OWNER_FILE &&
+      !(name.startsWith(`${OWNER_FILE}.`) && name.endsWith(".tmp"))
+    ) {
+      continue;
+    }
+    try {
+      const mtime = statSync(join(dir, name)).mtimeMs;
+      if (latest === null || mtime > latest) latest = mtime;
+    } catch {
+      // raced entry — skip it
+    }
+  }
+  return latest;
+};
+
+/**
+ * The last moment the dir shows evidence of a COMPLETE owner: the newer of
+ * the dir's own mtime (set at mkdir, bumped by every child add/remove — a
+ * mid-setup holder stamps it on each step) and the newest owner record's
+ * publish time. Null when nothing can be timed.
+ */
+const lastOwnerEvidenceMs = (dir: string): number | null => {
+  let latest: number | null = null;
+  try {
+    latest = statSync(dir).mtimeMs;
+  } catch {
+    // unstatable — fall through to the record files
+  }
+  const record = ownerRecordTimeMs(dir);
+  if (record !== null && (latest === null || record > latest)) {
+    latest = record;
+  }
+  return latest;
+};
+
+/**
+ * Bounded reclaim: true when no complete owner has touched this dir for
+ * `UPDATE_LOCK_RECLAIM_MS`. An untimeable dir is never reclaimed on a guess —
+ * failing to stat is a reason to keep holding, never to evict.
+ */
+const reclaimDue = (dir: string, nowMs: number): boolean => {
+  const since = lastOwnerEvidenceMs(dir);
+  return since !== null && nowMs - since > UPDATE_LOCK_RECLAIM_MS;
+};
+
+/**
+ * Move a quarantined dir back to `lockDir` only when the name is still free —
+ * POSIX `rename` replaces an EMPTY dir, so a new holder's empty setup dir
+ * could technically be overwritten mid-race; that's benign (the holder's
+ * owner.json publish simply lands inside the restored dir) while clobbering
+ * a populated foreign dir is not. Best-effort: a stranded quarantine copy is
+ * inert.
+ */
+const moveBackNoReplace = (from: string, to: string): void => {
+  try {
+    if (existsSync(to)) return;
+    renameSync(from, to);
+  } catch {
+    // best-effort — a leftover `.<tag>-*` dir is inert
+  }
+};
+
+/**
+ * Is the quarantined dir OURS? The dir inode captured at `mkdir` is DECISIVE
+ * when known: it covers a failed publish that left nothing readable, AND it
+ * keeps a foreign dir that swallowed our publish (the restored-during-setup
+ * race) from being provable-ours by record alone. Only when the inode was
+ * never captured (stat raced) do the record proofs apply: the published owner
+ * nonce, or our lone un-renamed publish temp.
+ */
+const quarantinedIsOurs = (
+  dir: string,
+  ours: { readonly nonce: string; readonly ino: number | null },
+): boolean => {
+  if (ours.ino !== null) {
+    try {
+      return statSync(dir).ino === ours.ino;
+    } catch {
+      // stat raced — fall through to the record checks
+    }
+  }
+  const owner = readOwnerFile(join(dir, OWNER_FILE));
+  if (owner !== null) return owner.nonce === ours.nonce;
+  const tmps = readTmpOwners(dir);
+  return tmps.length === 1 && tmps[0]?.nonce === ours.nonce;
+};
+
+/**
+ * Release only OUR lock. The dir is moved to quarantine FIRST — if it was
+ * stolen and re-acquired while we held it, the dir we move is the NEW owner's,
+ * the nonce check inside quarantine proves it isn't ours, and it moves back
+ * untouched. A check-then-delete here was the old bug: between the read and
+ * the recursive delete the path could change hands entirely.
+ */
+const releaseOrRestore = (
+  lockDir: string,
+  ours: { readonly nonce: string; readonly ino: number | null },
+): void => {
+  const quarantine = quarantinePath(lockDir, "rel", ours.nonce);
+  try {
+    renameSync(lockDir, quarantine);
+  } catch {
+    return; // already stolen/released — nothing of ours at that name
+  }
+  if (quarantinedIsOurs(quarantine, ours)) {
+    try {
+      rmSync(quarantine, { recursive: true, force: true });
+    } catch {
+      // best-effort — a leaked dir is recovered by the stale-steal path
+    }
+    return;
+  }
+  moveBackNoReplace(quarantine, lockDir);
+};
+
+const makeRelease = (
+  lockDir: string,
+  ours: { readonly nonce: string; readonly ino: number | null },
+): TUpdateLockRelease => {
+  let released = false;
+  return () => {
+    if (released) return;
+    released = true;
+    ourNonces.delete(ours.nonce);
+    releaseOrRestore(lockDir, ours);
+  };
+};
+
+const dirIno = (dir: string): number | null => {
+  try {
+    return statSync(dir).ino;
+  } catch {
+    return null;
+  }
+};
+
+/**
+ * Nonces THIS process has minted and not yet released — the third leg of
+ * same-process re-entry detection (pid AND start AND nonce). A lock record
+ * carrying one of our nonces is our own earlier acquisition, so a second
+ * acquire must fail fast instead of waiting out a self-deadlock; a record
+ * with a FOREIGN nonce at our pid + start is the same-second PID-reuse twin
+ * and is simply held — it must never look like ours.
+ */
+const ourNonces = new Set<string>();
+
+/** This process's start identity under the DEFAULT reader, cached (it cannot
+ *  change). Custom readers (tests) compute fresh each call. */
+let ownStart: string | null = null;
+const myStartIdentity = (
+  read: TProcessStartIdentityReader = processStartIdentity,
+): string => {
+  if (read === processStartIdentity && ownStart !== null) return ownStart;
+  let start: string;
+  try {
+    start = read(process.pid) ?? "";
+  } catch {
+    start = "";
+  }
+  if (read === processStartIdentity) ownStart = start;
+  return start;
+};
+
+/**
+ * Non-blocking acquire: mkdir + atomic owner.json publish, or null when held.
+ * The owner record is written to a nonce-named temp then renamed — readers
+ * only ever see a complete record. If the publish fails (or our dir was
+ * replaced between mkdir and publish) the lock is released through the SAME
+ * quarantine-verify path, so the cleanup can never delete a replacement
+ * holder's dir (the round-2 bug).
+ */
+export const tryAcquireUpdateLock = (
+  lockDir: string,
+  opts?: { readonly startIdentity?: TProcessStartIdentityReader },
+): TUpdateLockRelease | null => {
+  const nonce = newNonce();
+  const ours = { nonce, ino: null as number | null };
+  try {
+    mkdirSync(lockDir);
+  } catch {
+    return null;
+  }
+  ourNonces.add(nonce);
+  ours.ino = dirIno(lockDir);
+  const record: TOwnerRecord = {
+    kind: OWNER_KIND,
+    pid: process.pid,
+    start: myStartIdentity(opts?.startIdentity),
+    nonce,
+  };
+  const ownerPath = join(lockDir, OWNER_FILE);
+  const tmp = join(lockDir, `${OWNER_FILE}.${nonce}.tmp`);
+  let acquired = false;
+  try {
+    writeFileSync(tmp, JSON.stringify(record), { mode: 0o600 });
+    // Publish ONLY into a dir still provably ours and still unowned: the
+    // inode covers a restore-rename swapping our dir out mid-setup; the
+    // existsSync keeps the rename from clobbering a foreign owner.json that
+    // landed in a restored dir (an empty-dir POSIX rename CAN replace).
+    if (
+      ours.ino !== null &&
+      dirIno(lockDir) === ours.ino &&
+      !existsSync(ownerPath)
+    ) {
+      renameSync(tmp, ownerPath);
+      acquired = dirIno(lockDir) === ours.ino;
+    }
+  } catch {
+    acquired = false;
+  }
+  if (!acquired) {
+    // Our publish temp may have landed inside a foreign dir that was
+    // restored over ours — remove exactly OUR nonce-named file so a lone
+    // readable record can't mis-attribute a live foreign lock to this
+    // process (it would look stealable once we exit).
+    try {
+      rmSync(tmp, { force: true });
+    } catch {
+      // best-effort temp cleanup
+    }
+  }
+  // The dir is provably still ours when the inode matches — under this design
+  // nobody else can move an unmarked dir, but a foreign release's quarantine
+  // round-trip can briefly yoink it; the inode check is the decisive proof.
+  if (acquired) {
+    return makeRelease(lockDir, ours);
+  }
+  ourNonces.delete(nonce);
+  releaseOrRestore(lockDir, ours);
+  return null;
+};
+
+/**
+ * Atomically steal a lock dir we ALREADY judged reclaimable: rename it aside
+ * (only one racer wins the rename), re-validate INSIDE quarantine (the
+ * holder may have released + a new owner re-acquired between our read and
+ * the rename — the moved dir is then the new owner's — or a mid-setup
+ * publish may have landed mid-race: its fresh record mtime is still inside
+ * the bound), then delete only what is still stale or unproven past the
+ * reclaim bound. A proven-live owner — or anything still inside the bound —
+ * moves back no-replace.
+ */
+const stealStaleLock = (
+  lockDir: string,
+  probes: {
+    readonly pidAlive: (pid: number) => boolean;
+    readonly startIdentity: TProcessStartIdentityReader;
+  },
+  now: () => number,
+): boolean => {
+  const quarantine = quarantinePath(lockDir, "steal", newNonce());
+  try {
+    renameSync(lockDir, quarantine);
+  } catch {
+    return false; // already stolen/released by someone else
+  }
+  const owner = readOwner(quarantine);
+  const verdict = owner === null ? "unproven" : classifyOwner(owner, probes);
+  if (
+    verdict === "proven-live" ||
+    (verdict === "unproven" && !reclaimDue(quarantine, now()))
+  ) {
+    moveBackNoReplace(quarantine, lockDir);
+    return false;
+  }
+  try {
+    rmSync(quarantine, { recursive: true, force: true });
+  } catch {
+    // best-effort — a leftover `.steal-*` dir is inert
+  }
+  return true;
+};
+
+/**
+ * Acquire the swap lock, waiting up to `waitMs` for a live holder and stealing
+ * locks whose owner is provably gone (dead pid or PID reused — a crashed
+ * updater's lock is ALWAYS stealable, never held forever by a recycled pid),
+ * and reclaiming dirs that have shown no complete, proven-live owner for
+ * `UPDATE_LOCK_RECLAIM_MS` (a crash between mkdir and publish, or a holder
+ * that can never prove its start, can no longer wedge writers forever).
+ * Returns the release function, or null when the wait elapsed with a live
+ * holder still in place (or a same-process re-entry was attempted — never
+ * block on ourselves).
+ *
+ * Callers MUST wrap the critical section in try/finally + release: a leaked
+ * holder only degrades later writers to the stale-steal path once its process
+ * is gone, never to a deadlock.
+ */
+export const acquireUpdateLock = async (
+  lockDir: string,
+  opts: TUpdateLockOptions = {},
+): Promise<TUpdateLockRelease | null> => {
+  const waitMs = opts.waitMs ?? UPDATE_LOCK_WAIT_MS;
+  const now = opts.now ?? Date.now;
+  const sleep =
+    opts.sleep ?? ((ms: number) => new Promise((r) => setTimeout(r, ms)));
+  const probes = {
+    pidAlive: opts.pidAlive ?? defaultPidAlive,
+    startIdentity: opts.startIdentity ?? processStartIdentity,
+  };
+  const deadline = now() + waitMs;
+  for (;;) {
+    const release = tryAcquireUpdateLock(lockDir, {
+      startIdentity: probes.startIdentity,
+    });
+    if (release !== null) return release;
+    const owner = readOwner(lockDir);
+    // Same-process re-entry requires pid AND start AND nonce — but a nonce
+    // we minted can only live in a record this process published, so a hit
+    // proves all three. Report busy immediately instead of waiting out a
+    // self-deadlock. A foreign record at our pid+start with an UNOWNED
+    // nonce (same-second PID reuse) is just a live lock: wait like any
+    // other, never self-identify.
+    if (owner !== null && ourNonces.has(owner.nonce)) {
+      return null;
+    }
+    const verdict = owner === null ? "unproven" : classifyOwner(owner, probes);
+    // Provably dead → steal now. Unproven (unmarked, unreadable, or a live
+    // pid the record can't prove) → held ONLY until the dir has shown no
+    // complete owner for the reclaim bound, then stolen through the same
+    // quarantine path. Proven-live → never stolen, whatever the age.
+    if (
+      verdict === "stale" ||
+      (verdict === "unproven" && reclaimDue(lockDir, now()))
+    ) {
+      if (stealStaleLock(lockDir, probes, now)) continue;
+    }
+    if (now() >= deadline) return null;
+    await sleep(POLL_MS);
+  }
+};
+
+/**
+ * Scoped convenience: acquire → run `work` → release. Returns null when the
+ * lock could not be acquired inside the wait window.
+ */
+export const withUpdateLock = async <T>(
+  lockDir: string,
+  opts: TUpdateLockOptions,
+  work: () => Promise<T>,
+): Promise<T | null> => {
+  const release = await acquireUpdateLock(lockDir, opts);
+  if (release === null) return null;
+  try {
+    return await work();
+  } finally {
+    release();
+  }
+};
