@@ -108,6 +108,73 @@ const formatPsLstartUtc = (date: Date): string =>
 // architecture Linux exposes /proc for, regardless of CONFIG_HZ.
 const LINUX_USER_HZ = 100;
 
+/**
+ * Linux start identities are boot-scoped and monotonic (RT-1): the kernel
+ * boot id plus the process's /proc/<pid>/stat starttime in USER_HZ ticks
+ * since boot. Neither half moves on a wall-clock step, so a live owner can
+ * never read as dead, and no `ps` helper is needed at all (SH-2).
+ */
+const BOOT_IDENTITY_PREFIX = "boot:";
+const BOOT_IDENTITY_RE = /^boot:[0-9a-f-]{36}:\d+$/;
+
+/** True when `value` is a post-RT-1 Linux boot-scoped start identity. */
+export const isBootScopedStartIdentity = (value: string): boolean =>
+  BOOT_IDENTITY_RE.test(value);
+
+const procfsMounted = (): boolean => {
+  try {
+    statSync("/proc/self/stat");
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+/**
+ * The process's starttime in USER_HZ ticks since boot, from
+ * /proc/<pid>/stat field 22 (index 19 once pid and comm are dropped).
+ * `null` = confirmed dead, `undefined` = cannot determine.
+ */
+const linuxProcStartTicks = (pid: number): number | null | undefined => {
+  let stat: string;
+  try {
+    stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+  } catch (error) {
+    const code = (error as { readonly code?: unknown }).code;
+    if (code !== "ENOENT" && code !== "ENOTDIR") return undefined;
+    // A missing per-pid stat means a dead pid only when procfs itself is
+    // mounted — with no procfs at all every pid would read "dead".
+    return procfsMounted() ? null : undefined;
+  }
+  const afterComm = stat.slice(stat.lastIndexOf(") ") + 2).split(" ");
+  const ticks = Number(afterComm[19]);
+  return Number.isSafeInteger(ticks) && ticks > 0 ? ticks : undefined;
+};
+
+const linuxBootId = (): string | undefined => {
+  try {
+    const value = readFileSync("/proc/sys/kernel/random/boot_id", "utf8")
+      .trim()
+      .toLowerCase();
+    return /^[0-9a-f-]{36}$/.test(value) ? value : undefined;
+  } catch {
+    return undefined;
+  }
+};
+
+/**
+ * The canonical Linux start identity: `boot:<boot_id>:<starttime_ticks>`.
+ * `null` = confirmed dead (stat vanished), `undefined` = cannot determine.
+ */
+const linuxBootScopedIdentity = (pid: number): string | null | undefined => {
+  const ticks = linuxProcStartTicks(pid);
+  if (ticks === null || ticks === undefined) return ticks;
+  const bootId = linuxBootId();
+  return bootId === undefined
+    ? undefined
+    : `${BOOT_IDENTITY_PREFIX}${bootId}:${ticks}`;
+};
+
 const linuxBootTimeSeconds = (): number | undefined => {
   try {
     const table = readFileSync("/proc/stat", "utf8");
@@ -123,30 +190,35 @@ const linuxBootTimeSeconds = (): number | undefined => {
 };
 
 /**
- * Linux start identity without `ps` (procps is absent on debian-slim,
- * distroless, and some WSL images — EC-3). Reconstructs the SAME lstart
- * string `ps` would print so identities mix freely with ps-produced and
- * persisted values: epoch = /proc/stat btime + starttime/HZ, matching
+ * The LEGACY Linux start identity without `ps` (procps is absent on
+ * debian-slim, distroless, and some WSL images — EC-3). Reconstructs the
+ * pre-RT-1 lstart string `ps` would print so records persisted by older
+ * builds still compare: epoch = /proc/stat btime + starttime/HZ, matching
  * procps's own arithmetic (integer truncation), then lstart formatting.
  * `null` = confirmed dead (stat vanished), `undefined` = cannot determine.
  */
 const linuxProcStartIdentity = (pid: number): string | null | undefined => {
-  let stat: string;
-  try {
-    stat = readFileSync(`/proc/${pid}/stat`, "utf8");
-  } catch (error) {
-    const code = (error as { readonly code?: unknown }).code;
-    return code === "ENOENT" || code === "ENOTDIR" ? null : undefined;
-  }
-  const afterComm = stat.slice(stat.lastIndexOf(") ") + 2).split(" ");
-  // Field 22 (starttime) is index 19 once pid and comm are dropped.
-  const startJiffies = Number(afterComm[19]);
-  if (!Number.isSafeInteger(startJiffies) || startJiffies <= 0)
-    return undefined;
+  const ticks = linuxProcStartTicks(pid);
+  if (ticks === null || ticks === undefined) return ticks;
   const bootTime = linuxBootTimeSeconds();
   if (bootTime === undefined) return undefined;
-  const epochSeconds = bootTime + Math.floor(startJiffies / LINUX_USER_HZ);
+  const epochSeconds = bootTime + Math.floor(ticks / LINUX_USER_HZ);
   return formatPsLstartUtc(new Date(epochSeconds * 1000));
+};
+
+/**
+ * Convert a `boot:<boot_id>:<ticks>` identity back to epoch milliseconds —
+ * needed where a legacy wall-clock comparison (e.g. a legacy file lock's
+ * recorded creation time) must still evaluate a post-RT-1 probe. Returns
+ * null for a non-boot identity or when /proc/stat `btime` is unreadable.
+ */
+export const bootScopedStartIdentityMs = (identity: string): number | null => {
+  const match = /^boot:[0-9a-f-]{36}:(\d+)$/.exec(identity);
+  if (match === null) return null;
+  const ticks = Number(match[1]);
+  const bootTime = linuxBootTimeSeconds();
+  if (bootTime === undefined || !Number.isSafeInteger(ticks)) return null;
+  return (bootTime + Math.floor(ticks / LINUX_USER_HZ)) * 1000;
 };
 
 /**
@@ -248,12 +320,41 @@ const windowsProcessStartIdentity = (
   }
 };
 
-/** undefined is unavailable/unknown; null is a confirmed absent process. */
+/**
+ * The canonical process-start identity this build persists. On Linux that is
+ * the boot-scoped /proc pair — `boot:<boot_id>:<ticks>` — never the
+ * wall-clock-sensitive `ps lstart` text (RT-1), so no `ps` helper is invoked
+ * at all and a `ps` that rejects `lstart` cannot break session startup
+ * (SH-2). Windows keeps the FILETIME creation time; other POSIX platforms
+ * keep `ps lstart` with the same /proc-less liveness fallback as before.
+ *
+ * undefined is unavailable/unknown; null is a confirmed absent process.
+ */
 export const processStartIdentity = (
   pid: number,
 ): string | null | undefined => {
   if (!Number.isSafeInteger(pid) || pid <= 0) return undefined;
   if (process.platform === "win32") return windowsProcessStartIdentity(pid);
+  if (process.platform === "linux") return linuxBootScopedIdentity(pid);
+  return posixPsStartIdentity(pid);
+};
+
+/**
+ * The pre-RT-1 identity probe: `ps -o lstart=` text on POSIX (with the /proc
+ * reconstruction when `ps` is missing, fails, or exits nonzero — SH-2), the
+ * FILETIME creation time on Windows. Used to interpret records written by
+ * older builds and by the installers' shared bash lock, which still stores
+ * `ps lstart` text. Never use for NEW records — use {@link processStartIdentity}.
+ */
+export const legacyProcessStartIdentity = (
+  pid: number,
+): string | null | undefined => {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return undefined;
+  if (process.platform === "win32") return windowsProcessStartIdentity(pid);
+  return posixPsStartIdentity(pid);
+};
+
+const posixPsStartIdentity = (pid: number): string | null | undefined => {
   const [bin, ...args] = processStartCommand(pid);
   if (bin === undefined) return undefined;
   const result = spawnSync(bin, args, {
@@ -262,26 +363,24 @@ export const processStartIdentity = (
     windowsHide: true,
     env: { ...process.env, LC_ALL: "C", LANG: "C", TZ: "UTC" },
   });
-  // ps missing/unspawnable or hung (EC-3): degrade to /proc + kill(pid,0)
-  // rather than reporting every pid — including dead ones — as "unknown".
-  if (result.error) return posixIdentityWithoutPs(pid);
-  if (result.status !== 0) {
-    try {
-      process.kill(pid, 0);
-      return undefined;
-    } catch (error) {
-      if (error !== null && typeof error === "object" && "code" in error) {
-        const code = (error as { readonly code?: unknown }).code;
-        if (code === "ESRCH") return null;
-      }
-      return undefined;
-    }
-  }
+  // ps missing/unspawnable/hung (EC-3) or a ps that exits nonzero — a
+  // busybox-style build that rejects `lstart` (SH-2): degrade to /proc +
+  // kill(pid,0) rather than reporting every pid — including dead ones — as
+  // "unknown".
+  if (result.error || result.status !== 0) return posixIdentityWithoutPs(pid);
   const value = normalizeProcessStartIdentity(result.stdout);
   return value || undefined;
 };
 
-/** Compare a persisted identity without treating a failed probe as absence. */
+/**
+ * Compare a persisted identity without treating a failed probe as absence.
+ * Records written before RT-1 (or by the bash installers) carry the `ps
+ * lstart` text while a post-RT-1 build reads the boot-scoped Linux form —
+ * and a custom reader can still hand back lstart text against a boot-scoped
+ * record. On a format mismatch the live process is re-probed in the RECORD's
+ * own format before death is declared, so an old record of a live process
+ * still reads "alive" and a mismatched one still reads "dead".
+ */
 export const processIdentityStatus = (
   pid: number,
   expectedStartIdentity: string,
@@ -295,7 +394,30 @@ export const processIdentityStatus = (
   }
   if (actual === undefined) return "unknown";
   if (actual === null) return "dead";
-  return normalizeProcessStartIdentity(actual) ===
+  if (
+    normalizeProcessStartIdentity(actual) ===
+    normalizeProcessStartIdentity(expectedStartIdentity)
+  )
+    return "alive";
+  if (
+    isBootScopedStartIdentity(actual) ===
+    isBootScopedStartIdentity(expectedStartIdentity)
+  )
+    return "dead"; // same format, different identity — proven not the owner
+  // Mixed formats: re-probe in the record's format before convicting.
+  let bridged: string | null | undefined;
+  try {
+    bridged = (
+      isBootScopedStartIdentity(expectedStartIdentity)
+        ? processStartIdentity
+        : legacyProcessStartIdentity
+    )(pid);
+  } catch {
+    return "unknown";
+  }
+  if (bridged === undefined) return "unknown";
+  if (bridged === null) return "dead";
+  return normalizeProcessStartIdentity(bridged) ===
     normalizeProcessStartIdentity(expectedStartIdentity)
     ? "alive"
     : "dead";
