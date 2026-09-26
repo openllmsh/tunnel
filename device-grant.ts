@@ -11,7 +11,16 @@ export { DEVICE_GRANT_B64_MAX };
 
 export const DEVICE_GRANT_LABEL = "openllm-device-grant-v1";
 export const DEVICE_GRANT_VERSION = 1 as const;
-export const DEVICE_GRANT_TS_WINDOW_MS = 120_000;
+/**
+ * Acceptance window between the SIGNER's clock (the viewer device minting the
+ * grant) and the VERIFIER's clock (the daemon). Clock skew between the two is
+ * the common failure mode — a WSL2/VM clock drifting after sleep, a phone or
+ * PC on a manual clock — and it used to fail closed at ±120 s with a generic
+ * `stale_ts` the UI never surfaced (TCB-5). 10 min absorbs realistic drift;
+ * replay safety does NOT depend on this window — a replayed grant dies on the
+ * nonce LRU regardless — so widening it only relaxes the clock requirement.
+ */
+export const DEVICE_GRANT_TS_WINDOW_MS = 600_000;
 export const DEVICE_GRANT_NONCE_BYTES = 16;
 
 export type TDeviceGrantFields = {
