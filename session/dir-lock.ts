@@ -96,6 +96,7 @@ export type TDirLockStep =
   | "before-steal-revalidate"
   | "before-restore-claim"
   | "after-restore-claim"
+  | "before-restore-copy"
   | "before-release"
   | "after-release-rename"
   | "before-gc";
@@ -180,11 +181,18 @@ const markerPid = (lockDir: string, name: string): number | null => {
   return Number.isSafeInteger(value) && value > 0 ? value : null;
 };
 
-const releaseMarkerPid = (lockDir: string, name: string): number | null => {
+const releaseMarkerOwner = (
+  lockDir: string,
+  name: string,
+): { pid: number; nonce: string } | null => {
   const prefix = `${basename(lockDir)}.releasing-`;
   if (!name.startsWith(prefix)) return null;
-  const value = Number(name.slice(prefix.length).split("-")[0]);
-  return Number.isSafeInteger(value) && value > 0 ? value : null;
+  const match = /^(\d+)-([0-9a-f]{32})$/.exec(name.slice(prefix.length));
+  if (match === null) return null;
+  const pid = Number(match[1]);
+  return Number.isSafeInteger(pid) && pid > 0
+    ? { pid, nonce: match[2] ?? "" }
+    : null;
 };
 
 const markerExists = (lockDir: string): boolean => {
@@ -217,12 +225,14 @@ const liveReleaseMarkerExists = (
     return false;
   }
   return names.some((name) => {
-    const pid = releaseMarkerPid(lockDir, name);
-    return pid !== null && (opts.pidAlive ?? defaultPidAlive)(pid);
+    const owner = releaseMarkerOwner(lockDir, name);
+    return owner !== null && (opts.pidAlive ?? defaultPidAlive)(owner.pid);
   });
 };
 
 const activeNonces = new Set<string>();
+// Keep only releases that failed in this process. A retry removes the entry.
+const interruptedReleases = new Set<string>();
 const pendingClaims = new Map<
   string,
   {
@@ -281,6 +291,7 @@ const copyNoReplace = (
   from: string,
   to: string,
   codec: TDirLockCodec,
+  onStep?: TDirLockOptions["onStep"],
 ): boolean => {
   try {
     mkdirSync(to, { mode: 0o700 });
@@ -301,6 +312,7 @@ const copyNoReplace = (
       }
       if (!sourceStat.isFile()) continue;
       const data = readFileSync(source);
+      onStep?.("before-restore-copy", from);
       const fd = openSync(target, "wx", 0o600);
       try {
         writeFileSync(fd, data);
@@ -311,6 +323,10 @@ const copyNoReplace = (
       if (!readFileSync(target).equals(data))
         throw new Error("no-replace restore verification failed");
       copied.push(name);
+      // A release can remove the captured owner while this copy is in flight.
+      // Do not publish a snapshot whose source has already been released.
+      if (!readFileSync(source).equals(data))
+        throw new Error("source changed during no-replace restore");
     }
   } catch {
     for (const name of copied) {
@@ -364,12 +380,12 @@ export const moveDirNoReplace = (
   onStep?.("before-restore-claim", to);
   // The public options callback carries both paths. The step callback is kept
   // for simple fault injection and remains compatible with older adapters.
-  const result = copyNoReplace(from, to, codec);
+  const result = copyNoReplace(from, to, codec, onStep);
   onStep?.("after-restore-claim", to);
   return result;
 };
 
-const publish = (
+export const publishDirLockOwner = (
   lockDir: string,
   expectedIno: number,
   owner: TDirLockOwner,
@@ -377,6 +393,7 @@ const publish = (
   opts: TDirLockOptions,
 ): boolean => {
   opts.onStep?.("before-publish", lockDir);
+  if (!sameIno(lockDir, expectedIno) || owner.start.length === 0) return false;
   if (markerExists(lockDir) || insideMarkerExists(lockDir, codec)) return false;
   const tmp = join(lockDir, `${codec.ownerFile}.${owner.nonce}.tmp`);
   const target = join(lockDir, codec.ownerFile);
@@ -420,13 +437,63 @@ const publish = (
   return ok && codec.readOwner(lockDir)?.nonce === owner.nonce;
 };
 
-const release = (
+/** Finish a release only when the captured record proves ownership. */
+export const finishDirLockRelease = (
+  quarantine: string,
+  lockDir: string,
+  owner: Pick<TDirLockOwner, "pid" | "nonce">,
+  codec: TDirLockCodec,
+  opts: TDirLockOptions,
+): boolean => {
+  const parked = codec.readOwner(quarantine);
+  if (parked?.pid !== owner.pid || parked.nonce !== owner.nonce)
+    return moveDirNoReplace(
+      quarantine,
+      lockDir,
+      codec,
+      opts.onStep,
+      opts.onRestore,
+    );
+  try {
+    rmSync(quarantine, { recursive: true, force: true });
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+export const releaseDirLock = (
   lockDir: string,
   owner: TDirLockOwner,
   codec: TDirLockCodec,
   opts: TDirLockOptions,
 ): void => {
   opts.onStep?.("before-release", lockDir);
+  let current = codec.readOwner(lockDir);
+  if (current?.pid !== owner.pid || current.nonce !== owner.nonce) {
+    // A competing steal can park our generation before its foreign-owner
+    // check. Release our exact record there so the repair cannot revive it.
+    const base = basename(lockDir);
+    const prefixes = [`${base}.steal-`, `${base}.rel-`];
+    if (codec.markerInsideDir && base.endsWith(".d")) {
+      const stem = base.slice(0, -2);
+      prefixes.push(`${stem}.stale.`, `${stem}.rel.`);
+    }
+    try {
+      for (const name of readdirSync(dirname(lockDir))) {
+        if (!prefixes.some((prefix) => name.startsWith(prefix))) continue;
+        const path = join(dirname(lockDir), name);
+        const parked = codec.readOwner(path);
+        if (parked?.pid === owner.pid && parked.nonce === owner.nonce)
+          finishDirLockRelease(path, lockDir, owner, codec, opts);
+      }
+    } catch {
+      // A later sweep retains records whose ownership cannot be proved.
+    }
+    // A repair may have copied the record before its source was removed.
+    current = codec.readOwner(lockDir);
+    if (current?.pid !== owner.pid || current.nonce !== owner.nonce) return;
+  }
   const quarantine = uniquePath(lockDir, "rel", owner.nonce);
   const releaseMarker = releaseMarkerPath(lockDir, owner.nonce);
   let markerCreated = false;
@@ -447,25 +514,18 @@ const release = (
     }
     return;
   }
-  opts.onStep?.("after-release-rename", quarantine);
-  const parked = codec.readOwner(quarantine);
-  const ours = parked?.pid === owner.pid && parked.nonce === owner.nonce;
-  if (ours) {
-    try {
-      rmSync(quarantine, { recursive: true, force: true });
-      complete = true;
-    } catch {
-      // GC will retry the exact nonce-qualified residue.
-    }
-  } else {
-    moveDirNoReplace(quarantine, lockDir, codec, opts.onStep, opts.onRestore);
-    complete = true;
-  }
-  if (markerCreated && complete) {
-    try {
-      rmdirSync(releaseMarker);
-    } catch {
-      // GC removes a marker once its releasing process is dead.
+  try {
+    opts.onStep?.("after-release-rename", quarantine);
+    complete = finishDirLockRelease(quarantine, lockDir, owner, codec, opts);
+  } finally {
+    if (markerCreated && complete) {
+      try {
+        rmdirSync(releaseMarker);
+      } catch {
+        interruptedReleases.add(releaseMarker);
+      }
+    } else {
+      interruptedReleases.add(releaseMarker);
     }
   }
 };
@@ -497,14 +557,14 @@ const tryAcquireDirLockAttempt = (
     !markerExists(lockDir) &&
     !liveReleaseMarkerExists(lockDir, opts)
   ) {
-    if (publish(lockDir, pending.ino, pending.owner, codec, opts)) {
+    if (publishDirLockOwner(lockDir, pending.ino, pending.owner, codec, opts)) {
       pendingClaims.delete(lockDir);
       let released = false;
       return (): void => {
         if (released) return;
         released = true;
         activeNonces.delete(pending.owner.nonce);
-        release(lockDir, pending.owner, codec, opts);
+        releaseDirLock(lockDir, pending.owner, codec, opts);
       };
     }
   }
@@ -541,7 +601,7 @@ const tryAcquireDirLockAttempt = (
   }
   activeNonces.add(owner.nonce);
   try {
-    if (!publish(lockDir, expectedIno, owner, codec, opts)) {
+    if (!publishDirLockOwner(lockDir, expectedIno, owner, codec, opts)) {
       const currentIno = ino(lockDir);
       if (
         codec.readOwner(lockDir) === null &&
@@ -581,7 +641,7 @@ const tryAcquireDirLockAttempt = (
     if (done) return;
     done = true;
     activeNonces.delete(owner.nonce);
-    release(lockDir, owner, codec, opts);
+    releaseDirLock(lockDir, owner, codec, opts);
   };
 };
 
@@ -598,7 +658,7 @@ export const tryAcquireDirLock = (
   return tryAcquireDirLockAttempt(lockDir, codec, opts, state);
 };
 
-const steal = (
+export const stealDirLock = (
   lockDir: string,
   codec: TDirLockCodec,
   opts: TDirLockOptions,
@@ -743,10 +803,38 @@ export const sweepDirLockResidue = (
       }
       continue;
     }
-    const releaseMarker = releaseMarkerPid(lockDir, name);
+    const releaseMarker = releaseMarkerOwner(lockDir, name);
     if (releaseMarker !== null) {
       try {
-        if (!(opts.pidAlive ?? defaultPidAlive)(releaseMarker)) rmdirSync(path);
+        if (
+          interruptedReleases.has(path) ||
+          !(opts.pidAlive ?? defaultPidAlive)(releaseMarker.pid)
+        ) {
+          const quarantine = `${lockDir}.rel-${releaseMarker.pid}-${releaseMarker.nonce}`;
+          // Complete a stopped release. A foreign record stays in quarantine
+          // if another holder has already claimed the lock path.
+          if (existsSync(quarantine))
+            finishDirLockRelease(
+              quarantine,
+              lockDir,
+              releaseMarker,
+              codec,
+              opts,
+            );
+          if (!existsSync(quarantine)) {
+            rmdirSync(path);
+            interruptedReleases.delete(path);
+          } else {
+            const parked = codec.readOwner(quarantine);
+            if (
+              parked?.pid !== releaseMarker.pid ||
+              parked.nonce !== releaseMarker.nonce
+            ) {
+              rmdirSync(path);
+              interruptedReleases.delete(path);
+            }
+          }
+        }
       } catch {
         // Retry on the next bounded sweep.
       }
@@ -772,9 +860,37 @@ export const sweepDirLockResidue = (
       continue;
     }
     if (isRelease && liveReleaseMarkerExists(lockDir, opts)) continue;
-    if (owner !== null && classify(owner, opts) === "live") {
+    // A matching release name proves that this record was released. Never
+    // restore it: the releaser can remove its marker after we read the record.
+    if (!isRelease && owner !== null && classify(owner, opts) === "live") {
       if (!existsSync(lockDir))
         moveDirNoReplace(path, lockDir, codec, opts.onStep, opts.onRestore);
+      continue;
+    }
+    // Keep foreign files and unreadable owner records. A stale directory name
+    // alone does not prove that its contents belong to the lock protocol.
+    try {
+      if (!lstatSync(path).isDirectory()) continue;
+      const names = readdirSync(path);
+      const escapedOwnerFile = codec.ownerFile.replace(
+        /[.*+?^${}()|[\]\\]/g,
+        "\\$&",
+      );
+      const temporaryOwner = new RegExp(
+        `^${escapedOwnerFile}(?:\\.tmp\\.\\d+|\\.(?:[0-9a-f]{32}|\\d+)\\.tmp)$`,
+      );
+      if (
+        names.some((name) => {
+          if (!lstatSync(join(path, name)).isFile()) return true;
+          if (name === codec.ownerFile) return owner === null;
+          return (
+            !temporaryOwner.test(name) &&
+            !(codec.markerInsideDir && /^steal\.\d+\.[0-9a-f]+$/.test(name))
+          );
+        })
+      )
+        continue;
+    } catch {
       continue;
     }
     const age = recordTime(path, codec);
@@ -865,7 +981,7 @@ export const acquireDirLock = async (
       (verdict === "dead" && (policyStale ?? true)) ||
       (owner === null &&
         (policyStale ?? (age !== null && now() - age >= opts.reclaimMs)));
-    if (reclaimable && steal(lockDir, codec, opts)) continue;
+    if (reclaimable && stealDirLock(lockDir, codec, opts)) continue;
     if (now() >= deadline) return null;
     await (opts.sleep ?? defaultSleep)(
       Math.min(opts.pollMs ?? 50, deadline - now()),
@@ -904,7 +1020,7 @@ export const acquireDirLockSync = (
       (verdict === "dead" && (policyStale ?? true)) ||
       (owner === null &&
         (policyStale ?? (age !== null && now() - age >= opts.reclaimMs)));
-    if (reclaimable && steal(lockDir, codec, opts)) continue;
+    if (reclaimable && stealDirLock(lockDir, codec, opts)) continue;
     if (now() >= deadline) return null;
     Atomics.wait(wait, 0, 0, Math.min(opts.pollMs ?? 10, deadline - now()));
   }
