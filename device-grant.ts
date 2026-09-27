@@ -13,27 +13,24 @@ export const DEVICE_GRANT_LABEL = "openllm-device-grant-v1";
 export const DEVICE_GRANT_VERSION = 1 as const;
 /**
  * Acceptance window between the SIGNER's clock (the viewer device minting the
- * grant) and the VERIFIER's clock (the daemon). Clock skew between the two is
- * the common failure mode — a WSL2/VM clock drifting after sleep, a phone or
- * PC on a manual clock — and it used to fail closed at ±120 s with a generic
- * `stale_ts` the UI never surfaced (TCB-5). 10 min absorbs realistic drift;
- * replay safety does NOT depend on this window — a replayed grant dies on the
- * nonce LRU regardless — so widening it only relaxes the clock requirement.
+ * grant) and a trusted verifier clock. The daemon accepts a grant when its
+ * `ts` is within this window of the LOCAL clock OR of the server-anchored
+ * clock from the last bootstrap receipt (TCB-5), so a skewed daemon clock no
+ * longer fails valid grants. The window stays short on purpose: nonces live
+ * only in daemon memory, so after a restart this window is the replay bound
+ * (rework-8 kept 120 s instead of widening it).
  */
-export const DEVICE_GRANT_TS_WINDOW_MS = 600_000;
+export const DEVICE_GRANT_TS_WINDOW_MS = 120_000;
 export const DEVICE_GRANT_NONCE_BYTES = 16;
 /**
  * Hard bound on the verifier's nonce-replay map (`device-access-verify.ts`).
- * The map keeps one entry per accepted grant for the full acceptance window,
- * so the cap must scale with the window: the original 4096 was sized for the
- * 120 s window (~34 distinct valid grants per second sustained). The same
- * rate over the widened window needs 20 480 — a smaller cap would start
- * rejecting legitimate grants as `nonce_overload` once 4096 still-valid
- * nonces are in flight (rework finding). A full map still rejects rather than
- * evicting unexpired nonces — replay protection never degrades under load.
+ * A nonce is kept for twice the acceptance window, so the cap is 4096 per
+ * 120 s of retention (~34 distinct valid grants per second sustained). A full
+ * map rejects rather than evicting unexpired nonces: replay protection never
+ * degrades under load.
  */
 export const DEVICE_GRANT_NONCE_CAP =
-  4096 * Math.ceil(DEVICE_GRANT_TS_WINDOW_MS / 120_000);
+  4096 * Math.ceil((2 * DEVICE_GRANT_TS_WINDOW_MS) / 120_000);
 
 export type TDeviceGrantFields = {
   readonly v: 1;
