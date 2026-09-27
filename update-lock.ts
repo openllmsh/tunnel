@@ -12,7 +12,10 @@ import {
   tryAcquireDirLock,
 } from "./session/dir-lock";
 import type { TProcessStartIdentityReader } from "./session/local-runtime";
-import { processStartIdentity } from "./session/local-runtime";
+import {
+  legacyProcessStartIdentity,
+  processStartIdentity,
+} from "./session/local-runtime";
 
 export const updateLockDirFor = (destPath: string): string =>
   `${destPath}.update.lock`;
@@ -26,6 +29,7 @@ export type TUpdateLockOptions = {
   readonly sleep?: (ms: number) => Promise<void>;
   readonly pidAlive?: (pid: number) => boolean;
   readonly startIdentity?: TProcessStartIdentityReader;
+  readonly legacyStartIdentity?: TProcessStartIdentityReader;
 };
 export type TUpdateLockRelease = TDirLockRelease;
 
@@ -106,7 +110,8 @@ const options = (value: TUpdateLockOptions = {}): TDirLockOptions => {
     sleep: value.sleep,
     pidAlive: value.pidAlive,
     startIdentity: identity,
-    legacyStartIdentity: identity,
+    legacyStartIdentity:
+      value.legacyStartIdentity ?? legacyProcessStartIdentity,
     ownerStartIdentity: processStartIdentity,
     onRestore: (from, to): void => restoreGapHook?.(from, to),
     onStep: (step, path): void => {
@@ -118,12 +123,18 @@ const options = (value: TUpdateLockOptions = {}): TDirLockOptions => {
 
 export const tryAcquireUpdateLock = (
   lockDir: string,
-  opts?: { readonly startIdentity?: TProcessStartIdentityReader },
+  opts?: {
+    readonly startIdentity?: TProcessStartIdentityReader;
+    readonly legacyStartIdentity?: TProcessStartIdentityReader;
+  },
 ): TUpdateLockRelease | null =>
   tryAcquireDirLock(
     lockDir,
     updateCodec,
-    options({ startIdentity: opts?.startIdentity }),
+    options({
+      startIdentity: opts?.startIdentity,
+      legacyStartIdentity: opts?.legacyStartIdentity,
+    }),
   );
 
 export const acquireUpdateLock = async (
