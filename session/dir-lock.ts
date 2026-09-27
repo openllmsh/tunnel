@@ -90,6 +90,7 @@ export type TDirLockStep =
   | "before-legacy-rename"
   | "after-legacy-rename"
   | "before-steal-marker"
+  | "before-inside-steal-marker"
   | "after-steal-marker"
   | "before-steal-rename"
   | "after-steal-rename"
@@ -446,7 +447,9 @@ export const finishDirLockRelease = (
   opts: TDirLockOptions,
 ): boolean => {
   const parked = codec.readOwner(quarantine);
-  if (parked?.pid !== owner.pid || parked.nonce !== owner.nonce)
+  // A failed read does not prove a foreign owner. Let GC retry the read.
+  if (parked === null) return false;
+  if (parked.pid !== owner.pid || parked.nonce !== owner.nonce)
     return moveDirNoReplace(
       quarantine,
       lockDir,
@@ -663,8 +666,21 @@ export const stealDirLock = (
   codec: TDirLockCodec,
   opts: TDirLockOptions,
 ): boolean => {
-  const originalIno = ino(lockDir);
-  if (originalIno === null) return false;
+  let originalStat: ReturnType<typeof statSync>;
+  try {
+    originalStat = statSync(lockDir);
+  } catch {
+    return false;
+  }
+  const originalIno = originalStat.ino;
+  const sameGeneration = (path: string): boolean => {
+    try {
+      const current = statSync(path);
+      return current.dev === originalStat.dev && current.ino === originalIno;
+    } catch {
+      return false;
+    }
+  };
   const originalOwner = codec.readOwner(lockDir);
   let originalMtime = Number.NaN;
   try {
@@ -674,32 +690,26 @@ export const stealDirLock = (
   }
   const id = nonce();
   const siblingMarker = markerPath(lockDir, id);
+  const insideMarker = join(lockDir, `steal.${process.pid}.${id}`);
   let markerCreated = false;
+  let insideMarkerCreated = false;
+  const quarantine = uniquePath(lockDir, "steal", id);
   opts.onStep?.("before-steal-marker", lockDir);
   try {
     mkdirSync(siblingMarker, { mode: 0o700 });
     markerCreated = true;
     if (codec.markerInsideDir) {
-      const fd = openSync(
-        join(lockDir, `steal.${process.pid}.${id}`),
-        "wx",
-        0o600,
-      );
+      if (!sameGeneration(lockDir)) return false;
+      opts.onStep?.("before-inside-steal-marker", lockDir);
+      const fd = openSync(insideMarker, "wx", 0o600);
+      insideMarkerCreated = true;
       closeSync(fd);
+      // The path can change during open. Remove only our marker on abort.
+      if (!sameGeneration(lockDir)) return false;
     }
-  } catch {
-    try {
-      if (markerCreated) rmdirSync(siblingMarker);
-    } catch {
-      // GC handles a stranded marker.
-    }
-    return false;
-  }
-  opts.onStep?.("after-steal-marker", lockDir);
-  const quarantine = uniquePath(lockDir, "steal", id);
-  try {
+    opts.onStep?.("after-steal-marker", lockDir);
     opts.onStep?.("before-steal-revalidate", lockDir);
-    if (!sameIno(lockDir, originalIno)) return false;
+    if (!sameGeneration(lockDir)) return false;
     const currentOwner = codec.readOwner(lockDir);
     const sameOwner =
       currentOwner?.kind === originalOwner?.kind &&
@@ -716,20 +726,11 @@ export const stealDirLock = (
           (currentOwner === null &&
             initialAge !== null &&
             (opts.now ?? Date.now)() - initialAge >= opts.reclaimMs)));
-    if (!sameOwner || !initiallyReclaimable) {
-      try {
-        if (codec.markerInsideDir) {
-          unlinkSync(join(lockDir, `steal.${process.pid}.${id}`));
-        }
-      } catch {
-        // The generation vanished. The sibling marker is cleaned below.
-      }
-      return false;
-    }
+    if (!sameOwner || !initiallyReclaimable) return false;
     opts.onStep?.("before-steal-rename", lockDir);
     renameSync(lockDir, quarantine);
     opts.onStep?.("after-steal-rename", quarantine);
-    if (ino(quarantine) !== originalIno) {
+    if (!sameGeneration(quarantine)) {
       moveDirNoReplace(quarantine, lockDir, codec, opts.onStep, opts.onRestore);
       return false;
     }
@@ -768,6 +769,18 @@ export const stealDirLock = (
     }
     return false;
   } finally {
+    if (insideMarkerCreated) {
+      for (const path of [
+        insideMarker,
+        join(quarantine, `steal.${process.pid}.${id}`),
+      ]) {
+        try {
+          unlinkSync(path);
+        } catch {
+          // A moved or deleted generation leaves no marker at this path.
+        }
+      }
+    }
     if (markerCreated) {
       try {
         rmdirSync(siblingMarker);
@@ -827,8 +840,9 @@ export const sweepDirLockResidue = (
           } else {
             const parked = codec.readOwner(quarantine);
             if (
-              parked?.pid !== releaseMarker.pid ||
-              parked.nonce !== releaseMarker.nonce
+              parked !== null &&
+              (parked.pid !== releaseMarker.pid ||
+                parked.nonce !== releaseMarker.nonce)
             ) {
               rmdirSync(path);
               interruptedReleases.delete(path);
