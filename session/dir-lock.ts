@@ -10,6 +10,7 @@ import {
   existsSync,
   fsyncSync,
   linkSync,
+  lstatSync,
   mkdirSync,
   openSync,
   readdirSync,
@@ -85,6 +86,9 @@ export type TDirLockStep =
   | "after-mkdir"
   | "before-publish"
   | "after-publish"
+  | "after-legacy-pin"
+  | "before-legacy-rename"
+  | "after-legacy-rename"
   | "before-steal-marker"
   | "after-steal-marker"
   | "before-steal-rename"
@@ -787,6 +791,44 @@ const defaultNow = (): number => Date.now();
 const defaultSleep = (ms: number): Promise<void> =>
   new Promise((resolve) => setTimeout(resolve, ms));
 
+const migrateLegacyFile = (
+  lockDir: string,
+  codec: TDirLockCodec,
+  opts: TDirLockOptions,
+  deadline: number,
+): "migrated" | "retry" | null => {
+  if (opts.legacyHeld === undefined) return null;
+  let renamed = false;
+  try {
+    const pinned = lstatSync(lockDir);
+    if (!pinned.isFile()) return null;
+    opts.onStep?.("after-legacy-pin", lockDir);
+    if (opts.legacyHeld(deadline)) return null;
+    // Keep foreign files outside the directory residue sweep.
+    const parked = `${lockDir}.legacy-${process.pid}-${nonce()}`;
+    opts.onStep?.("before-legacy-rename", lockDir);
+    renameSync(lockDir, parked);
+    renamed = true;
+    opts.onStep?.("after-legacy-rename", parked);
+    const moved = lstatSync(parked);
+    if (moved.dev === pinned.dev && moved.ino === pinned.ino) {
+      unlinkSync(parked);
+      return "migrated";
+    }
+    if (moved.isDirectory()) {
+      moveDirNoReplace(parked, lockDir, codec, opts.onStep, opts.onRestore);
+    } else {
+      // A hard link cannot replace a file or an empty directory.
+      linkSync(parked, lockDir);
+      unlinkSync(parked);
+    }
+  } catch {
+    // Keep any foreign quarantine when the destination is occupied.
+    return renamed ? "retry" : null;
+  }
+  return "retry";
+};
+
 export const acquireDirLock = async (
   lockDir: string,
   codec: TDirLockCodec,
@@ -809,17 +851,10 @@ export const acquireDirLock = async (
     }
     const release = tryAcquireDirLock(lockDir, codec, opts);
     if (release !== null) return release;
-    if (opts.legacyHeld !== undefined) {
-      try {
-        if (!statSync(lockDir).isDirectory() && !opts.legacyHeld(deadline)) {
-          const parked = uniquePath(lockDir, "steal", nonce());
-          renameSync(lockDir, parked);
-          unlinkSync(parked);
-          continue;
-        }
-      } catch {
-        // A competing legacy cleanup owns the rename. Retry below.
-      }
+    const migration = migrateLegacyFile(lockDir, codec, opts, deadline);
+    if (migration !== null) {
+      if (migration === "retry" && now() >= deadline) return null;
+      continue;
     }
     const owner = codec.readOwner(lockDir);
     if (owner !== null && activeNonces.has(owner.nonce)) return null;
@@ -856,17 +891,10 @@ export const acquireDirLockSync = (
     }
     const release = tryAcquireDirLock(lockDir, codec, opts);
     if (release !== null) return release;
-    if (opts.legacyHeld !== undefined) {
-      try {
-        if (!statSync(lockDir).isDirectory() && !opts.legacyHeld(deadline)) {
-          const parked = uniquePath(lockDir, "steal", nonce());
-          renameSync(lockDir, parked);
-          unlinkSync(parked);
-          continue;
-        }
-      } catch {
-        // A competing legacy cleanup owns the rename. Retry below.
-      }
+    const migration = migrateLegacyFile(lockDir, codec, opts, deadline);
+    if (migration !== null) {
+      if (migration === "retry" && now() >= deadline) return null;
+      continue;
     }
     const owner = codec.readOwner(lockDir);
     const verdict = classify(owner, opts);
