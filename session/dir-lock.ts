@@ -110,7 +110,6 @@ export type TDirLockOptions = {
   readonly ownerlessMs?: number;
   readonly inode?: (path: string) => number | null | undefined;
   readonly isStale?: (path: string, asOfMtimeMs?: number) => boolean;
-  readonly removeOnUnprovenInode?: boolean;
   readonly propagatePublishErrors?: boolean;
   readonly legacyHeld?: (deadline: number) => boolean;
   readonly onStep?: (step: TDirLockStep, path: string) => void;
@@ -119,7 +118,11 @@ export type TDirLockOptions = {
 
 export type TDirLockRelease = () => void;
 
+type TDirLockAttemptState = { unprovenInode: boolean };
+
 const defaultPidAlive = (pid: number): boolean => {
+  // kill(0, 0) probes the caller's own process group, not a lock owner.
+  if (!Number.isSafeInteger(pid) || pid <= 0) return false;
   // kill(pid, 0) reports a zombie as alive until its parent reaps it. A
   // killed contender must not leave its marker or owner record blocking the
   // next generation during that brief reaping window.
@@ -188,6 +191,15 @@ const markerExists = (lockDir: string): boolean => {
     return false;
   }
   return names.some((name) => markerPid(lockDir, name) !== null);
+};
+
+const insideMarkerExists = (lockDir: string, codec: TDirLockCodec): boolean => {
+  if (!codec.markerInsideDir) return false;
+  try {
+    return readdirSync(lockDir).some((name) => name.startsWith("steal."));
+  } catch {
+    return true;
+  }
 };
 
 const liveReleaseMarkerExists = (
@@ -318,6 +330,16 @@ const copyNoReplace = (
       return false;
     }
   }
+  if (codec.markerInsideDir) {
+    for (const name of readdirSync(from)) {
+      if (!name.startsWith("steal.")) continue;
+      try {
+        unlinkSync(join(from, name));
+      } catch {
+        return false;
+      }
+    }
+  }
   try {
     rmdirSync(from);
   } catch {
@@ -351,6 +373,7 @@ const publish = (
   opts: TDirLockOptions,
 ): boolean => {
   opts.onStep?.("before-publish", lockDir);
+  if (markerExists(lockDir) || insideMarkerExists(lockDir, codec)) return false;
   const tmp = join(lockDir, `${codec.ownerFile}.${owner.nonce}.tmp`);
   const target = join(lockDir, codec.ownerFile);
   const data = codec.serializeOwner(owner);
@@ -361,7 +384,12 @@ const publish = (
   } finally {
     closeSync(fd);
   }
-  if (!sameIno(lockDir, expectedIno) || existsSync(target)) {
+  if (
+    !sameIno(lockDir, expectedIno) ||
+    existsSync(target) ||
+    markerExists(lockDir) ||
+    insideMarkerExists(lockDir, codec)
+  ) {
     try {
       unlinkSync(tmp);
     } catch {
@@ -443,25 +471,27 @@ const removeCreated = (lockDir: string): void => {
     // mkdir succeeded immediately before this path. It must still be empty
     // because publish has not started. rmdir cannot remove a live record.
     rmdirSync(lockDir);
-  } catch {
-    // A racer owns it now.
-  }
+  } catch {}
 };
 
-export const tryAcquireDirLock = (
+const tryAcquireDirLockAttempt = (
   lockDir: string,
   codec: TDirLockCodec,
   opts: TDirLockOptions,
+  state: TDirLockAttemptState,
 ): TDirLockRelease | null => {
   opts.onStep?.("before-mkdir", lockDir);
-  if (markerExists(lockDir)) return null;
+  const stealing = markerExists(lockDir);
+  const releasing = liveReleaseMarkerExists(lockDir, opts);
+  if (stealing || releasing) return null;
   const pending = pendingClaims.get(lockDir);
   if (
     pending !== undefined &&
     pending.codec.kind === codec.kind &&
     sameIno(lockDir, pending.ino) &&
     codec.readOwner(lockDir) === null &&
-    !markerExists(lockDir)
+    !markerExists(lockDir) &&
+    !liveReleaseMarkerExists(lockDir, opts)
   ) {
     if (publish(lockDir, pending.ino, pending.owner, codec, opts)) {
       pendingClaims.delete(lockDir);
@@ -484,10 +514,11 @@ export const tryAcquireDirLock = (
   opts.onStep?.("after-mkdir", lockDir);
   const expectedIno = readIno(lockDir, opts);
   if (expectedIno === null) {
-    if (opts.removeOnUnprovenInode !== false) removeCreated(lockDir);
+    state.unprovenInode = true;
+    removeCreated(lockDir);
     return null;
   }
-  if (markerExists(lockDir)) {
+  if (markerExists(lockDir) || insideMarkerExists(lockDir, codec)) {
     removeCreated(lockDir);
     return null;
   }
@@ -550,6 +581,19 @@ export const tryAcquireDirLock = (
   };
 };
 
+/** Retry immediately when our just-created generation cannot be pinned. */
+export const tryAcquireDirLock = (
+  lockDir: string,
+  codec: TDirLockCodec,
+  opts: TDirLockOptions,
+): TDirLockRelease | null => {
+  const state: TDirLockAttemptState = { unprovenInode: false };
+  const first = tryAcquireDirLockAttempt(lockDir, codec, opts, state);
+  if (first !== null || !state.unprovenInode) return first;
+  state.unprovenInode = false;
+  return tryAcquireDirLockAttempt(lockDir, codec, opts, state);
+};
+
 const steal = (
   lockDir: string,
   codec: TDirLockCodec,
@@ -557,6 +601,7 @@ const steal = (
 ): boolean => {
   const originalIno = ino(lockDir);
   if (originalIno === null) return false;
+  const originalOwner = codec.readOwner(lockDir);
   let originalMtime = Number.NaN;
   try {
     originalMtime = statSync(lockDir).mtimeMs;
@@ -589,6 +634,34 @@ const steal = (
   opts.onStep?.("after-steal-marker", lockDir);
   const quarantine = uniquePath(lockDir, "steal", id);
   try {
+    opts.onStep?.("before-steal-revalidate", lockDir);
+    if (!sameIno(lockDir, originalIno)) return false;
+    const currentOwner = codec.readOwner(lockDir);
+    const sameOwner =
+      currentOwner?.kind === originalOwner?.kind &&
+      currentOwner?.pid === originalOwner?.pid &&
+      currentOwner?.start === originalOwner?.start &&
+      currentOwner?.nonce === originalOwner?.nonce;
+    const initialVerdict = classify(currentOwner, opts);
+    const initialAge =
+      currentOwner === null ? originalMtime : recordTime(lockDir, codec);
+    const initiallyReclaimable =
+      (opts.isStale?.(lockDir, originalMtime) ?? false) ||
+      (opts.isStale === undefined &&
+        (initialVerdict === "dead" ||
+          (currentOwner === null &&
+            initialAge !== null &&
+            (opts.now ?? Date.now)() - initialAge >= opts.reclaimMs)));
+    if (!sameOwner || !initiallyReclaimable) {
+      try {
+        if (codec.markerInsideDir) {
+          unlinkSync(join(lockDir, `steal.${process.pid}.${id}`));
+        }
+      } catch {
+        // The generation vanished. The sibling marker is cleaned below.
+      }
+      return false;
+    }
     opts.onStep?.("before-steal-rename", lockDir);
     renameSync(lockDir, quarantine);
     opts.onStep?.("after-steal-rename", quarantine);
@@ -604,10 +677,12 @@ const steal = (
     // contenders can perpetually refresh the reclaim horizon and livelock.
     const age = parked === null ? originalMtime : recordTime(quarantine, codec);
     const reclaimable =
-      (opts.isStale?.(quarantine, originalMtime) ?? verdict === "dead") ||
-      (verdict === "unknown" &&
-        age !== null &&
-        (opts.now ?? Date.now)() - age >= opts.reclaimMs);
+      (opts.isStale?.(quarantine, originalMtime) ?? false) ||
+      (opts.isStale === undefined &&
+        (verdict === "dead" ||
+          (parked === null &&
+            age !== null &&
+            (opts.now ?? Date.now)() - age >= opts.reclaimMs)));
     if (!reclaimable) {
       moveDirNoReplace(quarantine, lockDir, codec, opts.onStep, opts.onRestore);
       return false;
@@ -752,11 +827,9 @@ export const acquireDirLock = async (
     const age = recordTime(lockDir, codec);
     const policyStale = opts.isStale?.(lockDir);
     const reclaimable =
-      (verdict !== "live" && (policyStale ?? verdict === "dead")) ||
-      (opts.isStale === undefined &&
-        verdict === "unknown" &&
-        age !== null &&
-        now() - age >= opts.reclaimMs);
+      (verdict === "dead" && (policyStale ?? true)) ||
+      (owner === null &&
+        (policyStale ?? (age !== null && now() - age >= opts.reclaimMs)));
     if (reclaimable && steal(lockDir, codec, opts)) continue;
     if (now() >= deadline) return null;
     await (opts.sleep ?? defaultSleep)(
@@ -800,11 +873,9 @@ export const acquireDirLockSync = (
     const age = recordTime(lockDir, codec);
     const policyStale = opts.isStale?.(lockDir);
     const reclaimable =
-      (verdict !== "live" && (policyStale ?? verdict === "dead")) ||
-      (opts.isStale === undefined &&
-        verdict === "unknown" &&
-        age !== null &&
-        now() - age >= opts.reclaimMs);
+      (verdict === "dead" && (policyStale ?? true)) ||
+      (owner === null &&
+        (policyStale ?? (age !== null && now() - age >= opts.reclaimMs)));
     if (reclaimable && steal(lockDir, codec, opts)) continue;
     if (now() >= deadline) return null;
     Atomics.wait(wait, 0, 0, Math.min(opts.pollMs ?? 10, deadline - now()));

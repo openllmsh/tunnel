@@ -110,7 +110,7 @@ const options = (value: TUpdateLockOptions = {}): TDirLockOptions => {
     ownerStartIdentity: processStartIdentity,
     onRestore: (from, to): void => restoreGapHook?.(from, to),
     onStep: (step, path): void => {
-      if (step === "after-steal-rename")
+      if (step === "after-steal-marker" || step === "after-steal-rename")
         stealGapHook?.(path.replace(/\.steal-[0-9]+-[0-9a-f]+$/, ""));
     },
   };
