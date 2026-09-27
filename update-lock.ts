@@ -666,8 +666,11 @@ const sweepUpdateLockResidue = (
     const owner = readOwner(path);
     const verdict = owner === null ? "unproven" : classifyOwner(owner, probes);
     if (verdict === "unproven" && !reclaimDue(path, now())) continue;
-    if (verdict === "proven-live" && !existsSync(lockDir)) {
-      moveBackNoReplace(path, lockDir);
+    if (verdict === "proven-live") {
+      // A proven-live owner's quarantine is never deleted — that updater's
+      // critical section may still be running. Restore it when the name is
+      // free; when a successor holds the name, leave it for the next pass.
+      if (!existsSync(lockDir)) moveBackNoReplace(path, lockDir);
       continue;
     }
     try {
