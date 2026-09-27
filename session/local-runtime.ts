@@ -385,6 +385,7 @@ export const processIdentityStatus = (
   pid: number,
   expectedStartIdentity: string,
   readIdentity: TProcessStartIdentityReader = processStartIdentity,
+  legacyReadIdentity: TProcessStartIdentityReader = legacyProcessStartIdentity,
 ): TProcessIdentity => {
   let actual: string | null | undefined;
   try {
@@ -404,13 +405,15 @@ export const processIdentityStatus = (
     isBootScopedStartIdentity(expectedStartIdentity)
   )
     return "dead"; // same format, different identity — proven not the owner
-  // Mixed formats: re-probe in the record's format before convicting.
+  // Mixed formats: re-probe in the record's format before convicting — the
+  // caller's readers apply here too, so a bounded restore-lock wait never
+  // outspends its remaining budget on a fixed-timeout legacy probe.
   let bridged: string | null | undefined;
   try {
     bridged = (
       isBootScopedStartIdentity(expectedStartIdentity)
-        ? processStartIdentity
-        : legacyProcessStartIdentity
+        ? readIdentity
+        : legacyReadIdentity
     )(pid);
   } catch {
     return "unknown";
