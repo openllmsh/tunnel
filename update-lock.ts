@@ -59,14 +59,18 @@
  */
 import { randomBytes } from "node:crypto";
 import {
+  closeSync,
   existsSync,
+  fsyncSync,
   mkdirSync,
+  openSync,
   readdirSync,
   readFileSync,
   renameSync,
   rmdirSync,
   rmSync,
   statSync,
+  unlinkSync,
   writeFileSync,
 } from "node:fs";
 import { basename, dirname, join } from "node:path";
@@ -185,6 +189,15 @@ export const setUpdateLockStealGapHookForTests = (
   hook: ((lockDir: string) => void) | null,
 ): void => {
   stealGapHookForTests = hook;
+};
+
+/** Test seam: runs inside a quarantine restore BEFORE the claim on `to` —
+ *  the exact check-then-move gap a racing claim used to exploit. */
+let moveBackGapHookForTests: ((from: string, to: string) => void) | null = null;
+export const setUpdateLockMoveBackGapHookForTests = (
+  hook: ((from: string, to: string) => void) | null,
+): void => {
+  moveBackGapHookForTests = hook;
 };
 
 const coerceOwner = (v: unknown): TOwnerRecord | null => {
@@ -353,19 +366,102 @@ const reclaimDue = (dir: string, nowMs: number): boolean => {
 };
 
 /**
- * Move a quarantined dir back to `lockDir` only when the name is still free —
- * POSIX `rename` replaces an EMPTY dir, so a new holder's empty setup dir
- * could technically be overwritten mid-race; that's benign (the holder's
- * owner.json publish simply lands inside the restored dir) while clobbering
- * a populated foreign dir is not. Best-effort: a stranded quarantine copy is
- * inert.
+ * Put a quarantined dir back at `lockDir` only when the name is still free.
+ * The claim is one exclusive `mkdir` — never `existsSync` then `rename`:
+ * POSIX `rename` REPLACES an empty target dir, so a fresh claim that landed
+ * inside the check-then-move gap was silently overwritten and its owner's
+ * publish then landed in a dir it did not create. Every regular file is
+ * copied VERIFIED — created no-replace, fsync'd and re-read — and the
+ * quarantined source is deleted only after EVERY copy lands whole: a
+ * partial restore never destroys the only valid owner record.
  */
 const moveBackNoReplace = (from: string, to: string): void => {
+  moveBackGapHookForTests?.(from, to);
   try {
-    if (existsSync(to)) return;
-    renameSync(from, to);
+    mkdirSync(to);
   } catch {
-    // best-effort — a leftover `.<tag>-*` dir is inert
+    return; // the name was re-taken — leave the quarantine parked
+  }
+  const restored: string[] = [];
+  let ok = true;
+  let children: string[] = [];
+  try {
+    children = readdirSync(from).sort();
+  } catch {
+    ok = false; // nothing copyable — back out cleanly below
+  }
+  if (ok) {
+    for (const child of children) {
+      const src = join(from, child);
+      const dst = join(to, child);
+      try {
+        if (!statSync(src).isFile()) continue;
+      } catch {
+        continue;
+      }
+      let created = false;
+      let fd = -1;
+      try {
+        const data = readFileSync(src);
+        fd = openSync(dst, "wx", 0o600);
+        created = true;
+        writeFileSync(fd, data);
+        fsyncSync(fd);
+        closeSync(fd);
+        fd = -1;
+        if (!readFileSync(dst).equals(data))
+          throw new Error("restored copy failed verification");
+        restored.push(child);
+      } catch {
+        ok = false;
+        if (fd >= 0) {
+          try {
+            closeSync(fd);
+          } catch {
+            // best effort
+          }
+        }
+        // Drop the partial file OUR copy created — never a foreign entry.
+        if (created) {
+          try {
+            unlinkSync(dst);
+          } catch {
+            // best effort
+          }
+        }
+        break;
+      }
+    }
+  }
+  if (!ok) {
+    // Roll the fresh dir back to its claimed-empty state: only the files
+    // THIS pass created are removed, then the dir itself when it is empty
+    // again. The quarantined source is preserved whole for a later pass.
+    for (const child of restored) {
+      try {
+        unlinkSync(join(to, child));
+      } catch {
+        // best effort
+      }
+    }
+    try {
+      rmdirSync(to);
+    } catch {
+      // a foreign entry arrived — leave the dir for its owner
+    }
+    return;
+  }
+  for (const child of restored) {
+    try {
+      unlinkSync(join(from, child));
+    } catch {
+      // best effort — a non-empty quarantine keeps the dir for the sweep
+    }
+  }
+  try {
+    rmdirSync(from);
+  } catch {
+    // best effort — foreign entries keep it parked for the sweep
   }
 };
 
