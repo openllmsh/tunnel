@@ -433,8 +433,19 @@ export const publishDirLockOwner = (
     }
     return false;
   }
-  const ok = sameIno(lockDir, expectedIno);
   opts.onStep?.("after-publish", lockDir);
+  const ok = sameIno(lockDir, expectedIno);
+  if (codec.markerInsideDir && (!ok || insideMarkerExists(lockDir, codec))) {
+    const current = codec.readOwner(lockDir);
+    if (current?.pid === owner.pid && current.nonce === owner.nonce) {
+      try {
+        unlinkSync(target);
+      } catch {
+        // The generation may already be quarantined.
+      }
+    }
+    return false;
+  }
   return ok && codec.readOwner(lockDir)?.nonce === owner.nonce;
 };
 
