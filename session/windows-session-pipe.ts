@@ -210,6 +210,42 @@ const winError = (result: Uint8Array): number =>
 const pipeFrameError = (operation: string, code: number): Error =>
   new Error(`${operation} failed with Win32 error ${code}`);
 
+/** Poll idle pipes less often. Use one timer. Reset the delay on I/O. */
+const createWindowsPipePoller = (
+  poll: () => void,
+): { wake(): void; stop(): void } => {
+  let delayMs = 4;
+  let stopped = false;
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  const schedule = (): void => {
+    if (stopped) return;
+    timer = setTimeout(() => {
+      timer = null;
+      poll();
+      if (timer === null) {
+        delayMs = Math.min(100, delayMs * 2);
+        schedule();
+      }
+    }, delayMs);
+    timer.unref?.();
+  };
+  schedule();
+  return {
+    wake: (): void => {
+      if (stopped) return;
+      if (delayMs === 4 && timer !== null) return;
+      delayMs = 4;
+      if (timer !== null) clearTimeout(timer);
+      schedule();
+    },
+    stop: (): void => {
+      stopped = true;
+      if (timer !== null) clearTimeout(timer);
+      timer = null;
+    },
+  };
+};
+
 /** Dial and authenticate the same native pipe handle that carries all traffic. */
 export const openVerifiedWindowsSessionPipe = (
   endpoint: string,
@@ -254,13 +290,12 @@ export const openVerifiedWindowsSessionPipe = (
   let ended = false;
   let closeRequested = false;
   let closeTimer: ReturnType<typeof setTimeout> | null = null;
-  let pollTimer: ReturnType<typeof setInterval> | null = null;
   const dataHandlers = new Set<(chunk: Uint8Array) => void>();
   const closeHandlers = new Set<() => void>();
   const finish = (): void => {
     if (ended) return;
     ended = true;
-    if (pollTimer !== null) clearInterval(pollTimer);
+    poller.stop();
     if (closeTimer !== null) clearTimeout(closeTimer);
     writes.length = 0;
     queuedBytes = 0;
@@ -298,6 +333,7 @@ export const openVerifiedWindowsSessionPipe = (
       }
       const count = winError(writeOut);
       if (count === 0) return;
+      poller.wake();
       writeOffset += count;
       queuedBytes -= count;
       if (writeOffset >= current.byteLength) {
@@ -329,6 +365,7 @@ export const openVerifiedWindowsSessionPipe = (
       }
       const count = winError(readOut);
       if (count === 0) return;
+      poller.wake();
       const chunk = readBuffer.slice(0, count);
       for (const handler of dataHandlers) {
         try {
@@ -340,8 +377,7 @@ export const openVerifiedWindowsSessionPipe = (
       }
     }
   };
-  pollTimer = setInterval(poll, 4);
-  pollTimer.unref?.();
+  const poller = createWindowsPipePoller(poll);
   const stop = (): void => {
     finish();
   };
@@ -363,6 +399,7 @@ export const openVerifiedWindowsSessionPipe = (
       }
       writes.push(chunk.slice());
       queuedBytes += chunk.byteLength;
+      poller.wake();
       flush();
     },
     close: (): void => {
@@ -514,6 +551,7 @@ class TPipeConnection implements TWindowsSessionPipeConnection {
     private readonly shim: TNativeClientBindings,
     private readonly handle: bigint,
     private readonly onEnd: () => void,
+    private readonly onActivity: () => void,
   ) {}
 
   onData(handler: (chunk: Uint8Array) => void): () => void {
@@ -540,6 +578,7 @@ class TPipeConnection implements TWindowsSessionPipeConnection {
     }
     this.writes.push(chunk.slice());
     this.queuedBytes += chunk.byteLength;
+    this.onActivity();
     this.flushWrites();
     return this.ended ? 0 : this.writes.length === 0 ? 1 : -1;
   }
@@ -585,6 +624,7 @@ class TPipeConnection implements TWindowsSessionPipeConnection {
       }
       const bytesRead = new DataView(this.readResult.buffer).getUint32(0, true);
       if (bytesRead === 0) return;
+      this.onActivity();
       const chunk = this.readBuffer.slice(0, bytesRead);
       for (const handler of this.dataHandlers) {
         try {
@@ -623,6 +663,7 @@ class TPipeConnection implements TWindowsSessionPipeConnection {
       }
       const count = new DataView(this.writeResult.buffer).getUint32(0, true);
       if (count === 0) return;
+      this.onActivity();
       this.writeOffset += count;
       this.queuedBytes -= count;
       if (this.writeOffset >= current.byteLength) {
@@ -735,9 +776,16 @@ export const createWindowsSessionPipeServer = (
       const connected = shim.ws_pipe_connect(instance.handle, connectErrorOut);
       const connectError = connected === 0 ? winError(connectErrorOut) : 0;
       if (connected !== 0 || connectError === PIPE_CONNECTED) {
-        const connection = new TPipeConnection(shim, instance.handle, () => {
-          instance.connection = null;
-        });
+        poller.wake();
+        const connection = new TPipeConnection(
+          shim,
+          instance.handle,
+          () => {
+            instance.connection = null;
+            poller.wake();
+          },
+          () => poller.wake(),
+        );
         instance.connection = connection;
         onConnection(connection);
         continue;
@@ -748,13 +796,12 @@ export const createWindowsSessionPipeServer = (
     if (closing && instances.every((instance) => instance.connection === null))
       finishClose();
   };
-  const timer = setInterval(poll, 4);
-  timer.unref?.();
+  const poller = createWindowsPipePoller(poll);
 
   const finishClose = (): void => {
     if (closed) return;
     closed = true;
-    clearInterval(timer);
+    poller.stop();
     if (closeTimer !== null) clearTimeout(closeTimer);
     for (const instance of instances) {
       instance.connection?.forceClose();
