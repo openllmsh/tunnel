@@ -146,6 +146,7 @@ function validatePublication(
   ctx: TLockControl,
   evidence: TLaunchEvidence,
   allowMissingTemp = false,
+  allowUnrecordedLink = false,
 ): void {
   const { publicBytes, tempBytes, publicGeneration, tempGeneration, claim } =
     evidence;
@@ -166,7 +167,15 @@ function validatePublication(
     parsed.nonce !== claim.nonce
   )
     throw new LockUnknownError("launch marker identity changed");
-  if (!evidence.names.includes(`published.v3.${publicGeneration}`))
+  if (
+    !evidence.names.includes(`published.v3.${publicGeneration}`) &&
+    !(
+      allowUnrecordedLink &&
+      evidence.names.every((name) => !name.startsWith("published.v3.")) &&
+      tempGeneration === publicGeneration &&
+      tempBytes?.equals(publicBytes)
+    )
+  )
     throw new LockUnknownError("launch file generation is not published");
   if (
     lockGeneration(ctx.parent) !==
@@ -211,9 +220,10 @@ function cleanupPublication(
   ctx: TLockControl,
   evidence: TLaunchEvidence,
   removePublic: boolean,
+  allowUnrecordedLink = false,
 ): void {
   if (removePublic) {
-    validatePublication(ctx, evidence, true);
+    validatePublication(ctx, evidence, true, allowUnrecordedLink);
     unlinkChild(ctx.parent, ctx.base);
   }
   if (evidence.tempGeneration !== null) {
@@ -294,10 +304,11 @@ function recoverEndedLaunch(ctx: TLockControl, mode: TLaunchMode): void {
           throw new LockUnknownError("launch child remains live or uncertain");
       }
     if (evidence.publicBytes !== null) {
-      validatePublication(ctx, evidence, true);
+      // A crash can follow the link before its generation marker.
+      validatePublication(ctx, evidence, true, true);
       if (mode === "mixed")
         throw new LockUnknownError(INCOMPLETE_LAUNCH_MESSAGE);
-      cleanupPublication(ctx, evidence, true);
+      cleanupPublication(ctx, evidence, true, true);
     } else cleanupPublication(ctx, evidence, false);
   } finally {
     close(evidence.transaction);
