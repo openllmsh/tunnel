@@ -403,8 +403,11 @@ const recoverControl = (
         removeEmptyChild(transaction, entry);
       }
       if (workerHeld) continue;
-      if (entries.includes("plan.v3.json"))
+      if (entries.includes("plan.v3.json")) {
         plan = parseDirLockPlan(readRecord(transaction, "plan.v3.json", 8192));
+        if (plan === null)
+          throw new LockUnknownError("invalid completed transaction plan");
+      }
     } finally {
       close(transaction);
     }
