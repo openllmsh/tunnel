@@ -870,6 +870,37 @@ const acquireAttempt = (
       if (!granted && dir) close(dir);
     }
   });
+/**
+ * Open the control. When the parent was removed, ask the caller once so it
+ * can create the parent again. A missing parent then fails as ENOENT.
+ */
+const openControlForAcquire = (
+  path: string,
+  kind: TLockKind,
+  opts: TDirLockOptions,
+): TLockControl => {
+  try {
+    return openLockControl(path, kind);
+  } catch (error) {
+    if (errorCode(error) !== "ENOENT") throw error;
+    opts.onStep?.("before-mkdir", path);
+    return openLockControl(path, kind);
+  }
+};
+/**
+ * The control vanished during this attempt. Close it and open it again.
+ * The caller counts this as one normal attempt. The wait deadline stops
+ * the retries. There is no separate reopen limit.
+ */
+const reopenVanishedControl = (
+  ctx: TLockControl,
+  opts: TDirLockOptions,
+): TLockControl => {
+  const path = ctx.path;
+  const kind = ctx.kind;
+  closeLockControl(ctx);
+  return openControlForAcquire(path, kind, opts);
+};
 export const acquireDirLockV3Sync = (
   path: string,
   codec: TDirLockCodec,
@@ -878,19 +909,25 @@ export const acquireDirLockV3Sync = (
   const clock = clockFor(opts);
   pendingReleases.get(path)?.();
   if (pendingReleases.size >= 64) return null;
-  const ctx = openLockControl(path, lockKindForCodec(codec));
+  let ctx: TLockControl | undefined;
   let release: TDirLockRelease | null = null;
   const poll = Math.max(1, opts.pollMs ?? 10);
   const attempts = 1 + Math.ceil(Math.max(0, opts.waitMs) / poll);
   const wait = new Int32Array(new SharedArrayBuffer(4));
   let publishError: unknown;
   try {
+    ctx = openControlForAcquire(path, lockKindForCodec(codec), opts);
     for (let index = 0; index < attempts; index++) {
       try {
         release = acquireAttempt(ctx, opts, clock);
       } catch (error) {
-        if (!["EIO", "ENOSPC"].includes(errorCode(error) ?? "")) throw error;
-        publishError ??= error;
+        if (errorCode(error) === "ENOENT") {
+          ctx = reopenVanishedControl(ctx, opts);
+        } else if (!["EIO", "ENOSPC"].includes(errorCode(error) ?? "")) {
+          throw error;
+        } else {
+          publishError ??= error;
+        }
       }
       if (release) return release;
       if (clock.reentered) return null;
@@ -901,7 +938,7 @@ export const acquireDirLockV3Sync = (
     if (publishError !== undefined) throw publishError;
     return null;
   } finally {
-    if (!release) closeLockControl(ctx);
+    if (!release && ctx) closeLockControl(ctx);
   }
 };
 export const acquireDirLockV3 = async (
@@ -912,18 +949,24 @@ export const acquireDirLockV3 = async (
   const clock = clockFor(opts);
   pendingReleases.get(path)?.();
   if (pendingReleases.size >= 64) return null;
-  const ctx = openLockControl(path, lockKindForCodec(codec));
+  let ctx: TLockControl | undefined;
   let release: TDirLockRelease | null = null;
   const poll = Math.max(1, opts.pollMs ?? 50);
   const attempts = 1 + Math.ceil(Math.max(0, opts.waitMs) / poll);
   let publishError: unknown;
   try {
+    ctx = openControlForAcquire(path, lockKindForCodec(codec), opts);
     for (let index = 0; index < attempts; index++) {
       try {
         release = acquireAttempt(ctx, opts, clock);
       } catch (error) {
-        if (!["EIO", "ENOSPC"].includes(errorCode(error) ?? "")) throw error;
-        publishError ??= error;
+        if (errorCode(error) === "ENOENT") {
+          ctx = reopenVanishedControl(ctx, opts);
+        } else if (!["EIO", "ENOSPC"].includes(errorCode(error) ?? "")) {
+          throw error;
+        } else {
+          publishError ??= error;
+        }
       }
       if (release) return release;
       if (clock.reentered) return null;
@@ -938,7 +981,7 @@ export const acquireDirLockV3 = async (
     if (publishError !== undefined) throw publishError;
     return null;
   } finally {
-    if (!release) closeLockControl(ctx);
+    if (!release && ctx) closeLockControl(ctx);
   }
 };
 export const inspectDirLockV3 = (

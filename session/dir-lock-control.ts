@@ -11,6 +11,7 @@ import type { TDirLockKind } from "./dir-lock-format";
 import {
   formatDirLockControlName,
   formatDirLockGeneration,
+  parseDirLockControlName,
 } from "./dir-lock-format";
 import type { TDirectoryHandle, TFileHandle } from "./dir-lock-fs";
 import {
@@ -366,5 +367,89 @@ export const removeEmptyGeneration = (
     if (errorCode(error) === "ENOTEMPTY" || errorCode(error) === "EEXIST")
       return false;
     throw error;
+  }
+};
+
+/**
+ * Remove idle control directories so a product uninstall can delete an empty
+ * state root. The lock protocol does not call this. A control is idle when
+ * it holds only the gate. Any other parent entry or control entry stays.
+ * Returns true when the parent is empty or already absent.
+ */
+export const removeIdleLockControls = (parentPath: string): boolean => {
+  let parent: TDirectoryHandle;
+  try {
+    parent = openPinnedPath(parentPath);
+  } catch (error) {
+    return errorCode(error) === "ENOENT";
+  }
+  try {
+    let names: string[];
+    try {
+      names = checkedNames(parent, 4096);
+    } catch {
+      return false;
+    }
+    if (names.length === 0) return true;
+    if (names.some((name) => parseDirLockControlName(name) === null))
+      return false;
+    for (const name of names) {
+      if (!idleGateOnly(parent, name)) return false;
+    }
+    for (const name of names) {
+      const dir = childDirectory(parent, name);
+      try {
+        const children = checkedNames(dir, 8);
+        if (children.length !== 1 || children[0] !== "meta.v3.lock")
+          return false;
+        unlinkChild(dir, "meta.v3.lock");
+      } finally {
+        close(dir);
+      }
+      try {
+        removeEmptyChild(parent, name);
+      } catch {
+        // A crash or a failed rmdir can leave a control with no gate.
+        return false;
+      }
+    }
+    try {
+      return checkedNames(parent, 4096).length === 0;
+    } catch {
+      return false;
+    }
+  } finally {
+    close(parent);
+  }
+};
+
+/** True when this control directory holds only a private gate file. */
+const idleGateOnly = (parent: TDirectoryHandle, name: string): boolean => {
+  let dir: TDirectoryHandle;
+  try {
+    dir = childDirectory(parent, name);
+  } catch {
+    return false;
+  }
+  try {
+    const children = checkedNames(dir, 8);
+    if (children.length !== 1 || children[0] !== "meta.v3.lock") return false;
+    const gate = openChild(dir, "meta.v3.lock", posixOpenFlags().O_RDONLY, 0);
+    try {
+      const stat = statDescriptor(gate.fd);
+      const uid = BigInt(process.getuid?.() ?? -1);
+      return (
+        stat.isFile() &&
+        stat.nlink === 1n &&
+        stat.uid === uid &&
+        (stat.mode & 0o077n) === 0n
+      );
+    } finally {
+      close(gate);
+    }
+  } catch {
+    return false;
+  } finally {
+    close(dir);
   }
 };
