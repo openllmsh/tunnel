@@ -1326,6 +1326,41 @@ export const runLegacyLockDoctor = async (
       domains.push({ path: `${args[++index]}.lock.d`, kind: "e" });
       continue;
     }
+    if (
+      arg === "--restore-dir" &&
+      args[index + 1] !== undefined &&
+      isAbsolute(args[index + 1] ?? "")
+    ) {
+      const restoreDir = args[index + 1] ?? "";
+      try {
+        if (existsSync(restoreDir)) {
+          const parent = openPinnedPath(restoreDir);
+          close(parent);
+        }
+      } catch (error) {
+        const incomplete = withCode(
+          {
+            ...emptyReport(),
+            retained: [
+              `unreadable --restore-dir: ${restoreDir} (${error instanceof Error ? error.message : String(error)})`,
+            ],
+          },
+          74,
+        );
+        console.log(
+          json
+            ? JSON.stringify(incomplete)
+            : `${incomplete.status}: ${incomplete.retained.join("; ")}`,
+        );
+        return 74;
+      }
+      domains.push({
+        path: join(restoreDir, ".openllm-restore.lock"),
+        kind: "r",
+      });
+      index += 1;
+      continue;
+    }
     const invalid = withCode(
       { ...emptyReport(), retained: [`invalid option: ${arg ?? ""}`] },
       2,
