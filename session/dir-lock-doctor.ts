@@ -1,5 +1,6 @@
 /** Explicit, generation-bound legacy lock clearance. Never called from normal acquisition. */
 import { existsSync, lstatSync, opendirSync } from "node:fs";
+import { homedir } from "node:os";
 import { basename, dirname, isAbsolute, join } from "node:path";
 import { performance } from "node:perf_hooks";
 import type { TLockControl, TLockKind } from "./dir-lock-control";
@@ -1163,6 +1164,14 @@ export const stateLockParents = (root: string): readonly string[] => [
   join(root, "bin"),
   join(root, "cli-install"),
 ];
+
+export const clientRestoreLockDomains = (
+  home: string = process.env.HOME || homedir(),
+): readonly TDoctorDomain[] =>
+  [".grok", ".hermes"].map((name) => ({
+    path: join(home, name, ".openllm-restore.lock"),
+    kind: "r",
+  }));
 
 export type TDoctorClearArgs = {
   readonly entry?: string;

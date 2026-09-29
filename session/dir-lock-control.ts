@@ -37,7 +37,13 @@ export class LegacyLockError extends Error {
     readonly path: string,
     readonly reason: string,
   ) {
-    super(LEGACY_LOCK_MESSAGE);
+    super(
+      `${LEGACY_LOCK_MESSAGE}. Lock: ${path}. Reason: ${reason}.${
+        basename(path) === ".openllm-restore.lock"
+          ? ` For a custom client directory, add --restore-dir ${JSON.stringify(dirname(path))}.`
+          : ""
+      }`,
+    );
     this.name = "LegacyLockError";
   }
 }
