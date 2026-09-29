@@ -47,6 +47,7 @@ import type {
 } from "./dir-lock-legacy";
 import {
   classifyLegacyProcessKind,
+  collectEmptyControl,
   inspectLegacyHold,
   loadLegacySamples,
   namespaceSuffix,
@@ -1162,6 +1163,9 @@ export const clearLegacyLocks = (
           close(hold);
         }
         removeEmptyChild(ctx.control, "legacy.v3.hold");
+        // Clearance is complete. Leave no control state behind in a client
+        // directory when nothing else remains in it.
+        collectEmptyControl(ctx);
         return true;
       });
       if (entered !== true) {

@@ -16,6 +16,7 @@ import {
 import {
   decodeDirLockBytes,
   encodeDirLockActor,
+  formatDirLockControlName,
   formatDirLockGeneration,
   parseDirLockOwnerRecord,
   parseDirLockPlan,
@@ -27,7 +28,9 @@ import {
   close,
   openChild,
   posixOpenFlags,
+  removeEmptyChild,
   statDescriptor,
+  unlinkChild,
 } from "./dir-lock-fs";
 import { observeDarwinProcess } from "./dir-lock-process";
 
@@ -170,6 +173,32 @@ export const namespaceSuffix = (
     }
   }
   return null;
+};
+/**
+ * Remove an empty control directory. Call this only under the metadata gate.
+ * The control is empty when it holds only the gate, the parent holds no
+ * namespace entry (no live directory, shadow, residue, or legacy artifact),
+ * and no claim, reservation, transaction, or hold remains. A caller that
+ * still holds a gate descriptor sees `GateVanishedError` on its next gate
+ * operation and opens the control again. A concurrent opener that created a
+ * fresh gate keeps the directory: the final removal fails with ENOTEMPTY.
+ * Returns true when this call removed the control directory.
+ */
+export const collectEmptyControl = (ctx: TLockControl): boolean => {
+  for (const name of checkedNames(ctx.parent, 4096))
+    if (namespaceSuffix(ctx, name) !== null) return false;
+  const names = checkedNames(ctx.control, 512);
+  if (names.length !== 1 || names[0] !== "meta.v3.lock") return false;
+  unlinkChild(ctx.control, "meta.v3.lock");
+  try {
+    removeEmptyChild(ctx.parent, formatDirLockControlName(ctx.base));
+  } catch (error) {
+    const code = errorCode(error);
+    if (code === "ENOTEMPTY" || code === "EEXIST" || code === "ENOENT")
+      return false;
+    throw error;
+  }
+  return true;
 };
 const roleFor = (name: string): TLegacyArtifact["role"] => {
   if (name.startsWith("steal.")) return "guard actor";
