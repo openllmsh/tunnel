@@ -674,32 +674,49 @@ const acquireAttempt = (
         if (done) return;
         let terminalPublished = false;
         try {
-          const released = withLockGate(ctx, () => {
-            if (opts.worker) {
-              const planDir = childDirectory(ctx.control, capturedTransaction);
-              try {
-                removeEmptyChild(
-                  planDir,
-                  `worker.v3.${encodeDirLockActor(opts.worker)}`,
+          const start = performance.now();
+          const wait = new Int32Array(new SharedArrayBuffer(4));
+          for (let attempt = 0; attempt <= 100; attempt++) {
+            const released = withLockGate(ctx, () => {
+              if (opts.worker) {
+                const planDir = childDirectory(
+                  ctx.control,
+                  capturedTransaction,
                 );
-              } finally {
-                close(planDir);
+                try {
+                  removeEmptyChild(
+                    planDir,
+                    `worker.v3.${encodeDirLockActor(opts.worker)}`,
+                  );
+                } finally {
+                  close(planDir);
+                }
               }
-            }
-            terminalize(ctx, claim, true);
-            terminalPublished = true;
-            opts.onStep?.("before-release", ctx.path);
-            cleanupClaim(
-              ctx,
-              capturedDir,
-              claim,
-              capturedTransaction,
-              capturedGeneration,
-            );
-            return true;
-          });
-          if (released === null)
-            throw new LockUnknownError("metadata gate is busy during release");
+              terminalize(ctx, claim, true);
+              terminalPublished = true;
+              opts.onStep?.("before-release", ctx.path);
+              cleanupClaim(
+                ctx,
+                capturedDir,
+                claim,
+                capturedTransaction,
+                capturedGeneration,
+              );
+              return true;
+            });
+            if (released !== null) break;
+            const elapsed = performance.now() - start;
+            if (
+              !Number.isFinite(elapsed) ||
+              elapsed < 0 ||
+              elapsed >= 1000 ||
+              attempt === 100
+            )
+              throw new LockUnknownError(
+                "metadata gate is busy during release",
+              );
+            Atomics.wait(wait, 0, 0, Math.min(10, 1000 - elapsed));
+          }
         } finally {
           if (terminalPublished) {
             done = true;
