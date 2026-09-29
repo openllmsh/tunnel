@@ -16,6 +16,7 @@ import {
   openLockControl,
   openPinnedPath,
   readRecord,
+  removeLinkedRecordTemp,
   sameChildGeneration,
   withLockGate,
   writeRecord,
@@ -850,8 +851,22 @@ const applyPlan = (
 const removeIntent = (hold: TDirectoryHandle, name: string): void => {
   const intent = childDirectory(hold, name);
   try {
-    readRecord(intent, "plan.v3.json", 65536);
-    unlinkChild(intent, "plan.v3.json");
+    const entries = checkedNames(intent, 2);
+    if (
+      entries.some(
+        (entry) => entry !== "plan.v3.json" && entry !== "plan.v3.tmp",
+      )
+    )
+      throw new Error("unknown doctor intent record");
+    if (entries.includes("plan.v3.json")) {
+      removeLinkedRecordTemp(intent, "plan.v3.tmp", "plan.v3.json", 65536);
+      readRecord(intent, "plan.v3.json", 65536);
+      unlinkChild(intent, "plan.v3.json");
+    } else if (entries.includes("plan.v3.tmp")) {
+      // An incomplete intent cannot authorize target changes.
+      readRecord(intent, "plan.v3.tmp", 65536);
+      unlinkChild(intent, "plan.v3.tmp");
+    }
   } finally {
     close(intent);
   }
@@ -988,11 +1003,27 @@ export const clearLegacyLocks = (
             INTENT.test(entry),
           )) {
             const intent = childDirectory(hold, name);
-            let plan: TDoctorPlan | null;
+            let plan: TDoctorPlan | null = null;
+            let published = false;
             try {
-              plan = parseDoctorPlan(readRecord(intent, "plan.v3.json", 65536));
+              published = childExists(intent, "plan.v3.json");
+              if (published) {
+                removeLinkedRecordTemp(
+                  intent,
+                  "plan.v3.tmp",
+                  "plan.v3.json",
+                  65536,
+                );
+                plan = parseDoctorPlan(
+                  readRecord(intent, "plan.v3.json", 65536),
+                );
+              }
             } finally {
               close(intent);
+            }
+            if (!published) {
+              removeIntent(hold, name);
+              continue;
             }
             if (
               plan === null ||
