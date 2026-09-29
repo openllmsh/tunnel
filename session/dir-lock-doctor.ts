@@ -26,6 +26,7 @@ import {
   decodeDirLockActor,
   decodeDirLockBytes,
   encodeDirLockActor,
+  formatDirLockControlName,
   parseDirLockControlName,
   parseDirLockOwnerRecord,
   parseDirLockPlan,
@@ -64,7 +65,11 @@ import {
   processStartIdentity,
 } from "./local-runtime";
 
-export type TDoctorDomain = { readonly path: string; readonly kind: TLockKind };
+export type TDoctorDomain = {
+  readonly path: string;
+  readonly kind: TLockKind;
+  readonly optional?: boolean;
+};
 export type TDoctorReport = {
   readonly code: 0 | 2 | 73 | 74;
   readonly status:
@@ -892,6 +897,34 @@ const removeIntent = (hold: TDirectoryHandle, name: string): void => {
   removeEmptyChild(hold, name);
 };
 
+const hasDomainEvidence = (domain: TDoctorDomain): boolean => {
+  const parent = openPinnedPath(dirname(domain.path));
+  try {
+    const stat = statDescriptor(parent.fd);
+    if (
+      stat.uid !== BigInt(process.getuid?.() ?? -1) ||
+      (stat.mode & 0o022n) !== 0n
+    )
+      throw new Error(`doctor parent is not private: ${dirname(domain.path)}`);
+    const base = basename(domain.path);
+    const controlName = formatDirLockControlName(base);
+    const stem = base.endsWith(".d") ? base.slice(0, -2) : base;
+    const launchStem = base.endsWith(".launch.v3") ? base.slice(0, -3) : null;
+    return checkedNames(parent, 4096).some(
+      (name) =>
+        name === controlName ||
+        name === base ||
+        name.startsWith(`${base}.`) ||
+        ((domain.kind === "e" || domain.kind === "v") &&
+          (name === stem || name.startsWith(`${stem}.`))) ||
+        (launchStem !== null &&
+          (name === launchStem || name.startsWith(`${launchStem}.`))),
+    );
+  } finally {
+    close(parent);
+  }
+};
+
 export const clearLegacyLocks = (
   domains: readonly TDoctorDomain[],
   deps: TDoctorProcessDeps = realProcessDeps,
@@ -906,6 +939,7 @@ export const clearLegacyLocks = (
     ...new Map(domains.map((domain) => [domain.path, domain])).values(),
   ];
   const contexts: TLockControl[] = [];
+  const skipped: string[] = [];
   try {
     for (const domain of unique) {
       if (!isAbsolute(domain.path))
@@ -914,7 +948,17 @@ export const clearLegacyLocks = (
           2,
         );
       if (!existsSync(dirname(domain.path))) continue;
-      const ctx = openLockControl(domain.path, domain.kind);
+      let ctx: TLockControl;
+      try {
+        if (!hasDomainEvidence(domain)) continue;
+        ctx = openLockControl(domain.path, domain.kind);
+      } catch (error) {
+        if (!domain.optional) throw error;
+        skipped.push(
+          `unsafe optional client lock parent: ${dirname(domain.path)} (${error instanceof Error ? error.message : String(error)})`,
+        );
+        continue;
+      }
       contexts.push(ctx);
       const observed = withLockGate(ctx, () => {
         try {
@@ -929,10 +973,13 @@ export const clearLegacyLocks = (
           refused: add(report.refused, `metadata gate busy: ${domain.path}`),
         };
     }
+    if (skipped.length)
+      report = { ...report, retained: [...report.retained, ...skipped] };
     if (report.refused.length) return withCode(report, 73);
-    if (options.sampleOnly) return report;
+    if (options.sampleOnly)
+      return skipped.length ? withCode(report, 74) : report;
     if (!contexts.some((ctx) => childExists(ctx.control, "legacy.v3.hold")))
-      return report;
+      return skipped.length ? withCode(report, 74) : report;
     const currentView = (): TProcessView => {
       const view = processView(deadline, deps);
       for (const pid of options.actors ?? []) {
@@ -996,7 +1043,7 @@ export const clearLegacyLocks = (
       }
     }
     if (report.refused.length) return withCode(report, 73);
-    if (report.retained.length) return withCode(report, 74);
+    if (report.retained.length > skipped.length) return withCode(report, 74);
     for (const ctx of contexts) {
       const entered = withLockGate(ctx, () => {
         if (!childExists(ctx.control, "legacy.v3.hold")) return true;
@@ -1131,7 +1178,7 @@ export const clearLegacyLocks = (
         return withCode(report, 73);
       }
     }
-    return report;
+    return skipped.length ? withCode(report, 74) : report;
   } catch (error) {
     return withCode(
       {
@@ -1201,6 +1248,7 @@ export const clientRestoreLockDomains = (
   [".grok", ".hermes"].map((name) => ({
     path: join(home, name, ".openllm-restore.lock"),
     kind: "r",
+    optional: true,
   }));
 
 export type TDoctorClearArgs = {
