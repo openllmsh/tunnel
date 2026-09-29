@@ -365,7 +365,17 @@ const evaluateSamples = (
   const blockers: string[] = [];
   const excluded: { pid: number; comm: string }[] = [];
   const uncertain: string[] = [];
-  for (const artifact of artifacts) {
+  // A removed artifact does not end its recorded actor.
+  const evidence: readonly TLegacyArtifact[] = [
+    ...artifacts,
+    ...samples.filter(
+      (sample) =>
+        !artifacts.some((artifact) =>
+          sameLegacyArtifact(sample, artifact, ctx.path),
+        ),
+    ),
+  ];
+  for (const artifact of evidence) {
     if (
       artifact.artifactType === "unknown" ||
       artifact.artifactGeneration === null ||
