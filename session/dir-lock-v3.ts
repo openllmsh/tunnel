@@ -20,6 +20,7 @@ import {
   openPinnedPath,
   readRecord,
   removeEmptyGeneration,
+  removeLinkedRecordTemp,
   sameChildGeneration,
   withFileHandle,
   withLockGate,
@@ -315,6 +316,7 @@ const cleanupClaim = (
       lockGeneration(dir) !== generation
     )
       return false;
+    removeLinkedRecordTemp(transaction, "plan.v3.tmp", "plan.v3.json", 8192);
     if (checkedNames(transaction, 8).some((name) => name !== "plan.v3.json"))
       return false;
     const names = checkedNames(dir, 512);

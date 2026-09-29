@@ -159,6 +159,27 @@ export const writeRecord = (
   linkChild(dir, temp, dir, name);
   unlinkChild(dir, temp);
 };
+export const removeLinkedRecordTemp = (
+  dir: TDirectoryHandle,
+  temp: string,
+  name: string,
+  limit: number,
+): void => {
+  if (!childExists(dir, temp)) return;
+  readRecord(dir, temp, limit);
+  readRecord(dir, name, limit);
+  const source = openChild(dir, temp, posixOpenFlags().O_RDONLY, 0);
+  withFileHandle(source, () => {
+    const published = openChild(dir, name, posixOpenFlags().O_RDONLY, 0);
+    withFileHandle(published, () => {
+      const a = statDescriptor(source.fd);
+      const b = statDescriptor(published.fd);
+      if (a.dev !== b.dev || a.ino !== b.ino)
+        throw new LockUnknownError("plan temp is not the published hard link");
+      unlinkChild(dir, temp);
+    });
+  });
+};
 export const ensureDirectory = (
   parent: TDirectoryHandle,
   name: string,
