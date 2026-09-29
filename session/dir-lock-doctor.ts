@@ -626,16 +626,14 @@ const supportedDirectoryTarget = (ctx: TLockControl, name: string): boolean => {
   if (name === ctx.base) return true;
   const suffix = namespaceSuffix(ctx, name);
   if (suffix === null || suffix === "") return false;
-  if (
-    /^(?:steal-|rel-|stealing-|releasing-)[1-9][0-9]{0,9}-[0-9a-fA-F]{32}$/.test(
+  const match =
+    /^(?:steal-|rel-|stealing-|releasing-)([1-9][0-9]{0,9})-[0-9a-fA-F]{32}$/.exec(
       suffix,
-    )
-  )
-    return true;
-  if (/^stale\.[1-9][0-9]{0,9}\.[0-9a-fA-F]+\.[0-9]+$/.test(suffix))
-    return true;
-  if (/^rel\.[1-9][0-9]{0,9}\.[0-9a-fA-F]+$/.test(suffix)) return true;
-  return /^parked-[1-9][0-9]{0,9}\.[0-9]+$/.test(suffix);
+    ) ??
+    /^stale\.([1-9][0-9]{0,9})\.[0-9a-fA-F]+\.[0-9]+$/.exec(suffix) ??
+    /^rel\.([1-9][0-9]{0,9})\.[0-9a-fA-F]+$/.exec(suffix) ??
+    /^parked-([1-9][0-9]{0,9})\.[0-9]+$/.exec(suffix);
+  return match !== null && canonicalPid(match[1] ?? "");
 };
 const emptyAnchor = (ctx: TLockControl, name: string): boolean => {
   if (name !== ctx.base) return false;
@@ -908,17 +906,10 @@ const hasDomainEvidence = (domain: TDoctorDomain): boolean => {
       throw new Error(`doctor parent is not private: ${dirname(domain.path)}`);
     const base = basename(domain.path);
     const controlName = formatDirLockControlName(base);
-    const stem = base.endsWith(".d") ? base.slice(0, -2) : base;
-    const launchStem = base.endsWith(".launch.v3") ? base.slice(0, -3) : null;
     return checkedNames(parent, 4096).some(
       (name) =>
         name === controlName ||
-        name === base ||
-        name.startsWith(`${base}.`) ||
-        ((domain.kind === "e" || domain.kind === "v") &&
-          (name === stem || name.startsWith(`${stem}.`))) ||
-        (launchStem !== null &&
-          (name === launchStem || name.startsWith(`${launchStem}.`))),
+        namespaceSuffix({ base, kind: domain.kind }, name) !== null,
     );
   } finally {
     close(parent);

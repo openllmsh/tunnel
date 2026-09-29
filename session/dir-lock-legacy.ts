@@ -141,7 +141,7 @@ const isGeneration = (value: unknown): value is string =>
 export const hasProtocolTag = (name: string): boolean =>
   name.split(".").includes("v3");
 export const namespaceSuffix = (
-  ctx: TLockControl,
+  ctx: Pick<TLockControl, "base" | "kind">,
   name: string,
 ): string | null => {
   if (ctx.kind === "a") {
