@@ -912,8 +912,7 @@ export const clearLegacyLocks = (
       return view;
     };
     let view = currentView();
-    if (view.blockers.length)
-      return withCode({ ...report, refused: view.blockers }, 73);
+    if (view.blockers.length) report = { ...report, refused: view.blockers };
     // Initial preflight across every domain. No target deletion until all pass.
     for (const ctx of contexts) {
       const artifacts = scanLegacyArtifacts(ctx);
@@ -1328,6 +1327,9 @@ export const runLegacyLockDoctor = async (
   }
   const details = [
     ...report.refused.map((reason) => `refused: ${reason}`),
+    ...report.excludedByKind.map(
+      (actor) => `excluded by kind: PID ${actor.pid} (${actor.comm})`,
+    ),
     ...report.retained.map((reason) => `retained: ${reason}`),
     ...report.pending.map((reason) => `pending: ${reason}`),
   ];
