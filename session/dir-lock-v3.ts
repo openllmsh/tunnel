@@ -49,6 +49,7 @@ import {
   unlinkChild,
 } from "./dir-lock-fs";
 import { inspectLegacyHold, namespaceSuffix } from "./dir-lock-legacy";
+import { removeEndedVendorGroups } from "./dir-lock-vendor";
 import { processIdentityStatus, processStartIdentity } from "./local-runtime";
 
 const pendingReleases = new Map<string, TDirLockRelease>();
@@ -201,9 +202,17 @@ const retryCancellations = (ctx: TLockControl): void => {
     if (pending.transaction && pending.worker) {
       const transaction = childDirectory(ctx.control, pending.transaction);
       try {
+        if (
+          ctx.kind === "v" &&
+          childExists(transaction, "groups.v3") &&
+          !removeEndedVendorGroups(transaction, true)
+        )
+          throw new LockUnknownError("vendor process group has not ended");
         const workerName = `worker.v3.${encodeDirLockActor(pending.worker)}`;
         if (childExists(transaction, workerName))
           removeEmptyChild(transaction, workerName);
+        if (ctx.kind === "v" && childExists(transaction, "groups.v3"))
+          removeEndedVendorGroups(transaction);
       } finally {
         close(transaction);
       }
@@ -378,10 +387,7 @@ const recoverControl = (
       let workerHeld = false;
       for (const entry of entries) {
         if (entry === "plan.v3.tmp" || entry === "plan.v3.json") continue;
-        if (ctx.kind === "v") {
-          workerHeld = true;
-          break;
-        }
+        if (ctx.kind === "v" && entry === "groups.v3") continue;
         const worker = entry.startsWith("worker.v3.")
           ? decodeDirLockActor(entry.slice(10))
           : null;
@@ -397,6 +403,19 @@ const recoverControl = (
           workerHeld = true;
           break;
         }
+      }
+      if (workerHeld) continue;
+      if (
+        ctx.kind === "v" &&
+        entries.some(
+          (entry) => entry.startsWith("worker.v3.") || entry === "groups.v3",
+        ) &&
+        !removeEndedVendorGroups(transaction, true)
+      )
+        continue;
+      for (const entry of entries.filter((entry) =>
+        entry.startsWith("worker.v3."),
+      )) {
         const workerDir = childDirectory(transaction, entry);
         try {
           checkedNames(workerDir, 0);
@@ -405,7 +424,8 @@ const recoverControl = (
         }
         removeEmptyChild(transaction, entry);
       }
-      if (workerHeld) continue;
+      if (ctx.kind === "v" && entries.includes("groups.v3"))
+        removeEndedVendorGroups(transaction);
       if (entries.includes("plan.v3.json")) {
         plan = parseDirLockPlan(readRecord(transaction, "plan.v3.json", 8192));
         if (plan === null)
@@ -630,6 +650,7 @@ const acquireAttempt = (
       if (opts.worker) {
         const planDir = childDirectory(ctx.control, transaction);
         try {
+          if (ctx.kind === "v") mkdirRecord(planDir, "groups.v3");
           mkdirRecord(planDir, `worker.v3.${encodeDirLockActor(opts.worker)}`);
         } finally {
           close(planDir);
@@ -698,10 +719,20 @@ const acquireAttempt = (
                   capturedTransaction,
                 );
                 try {
+                  if (
+                    ctx.kind === "v" &&
+                    childExists(planDir, "groups.v3") &&
+                    !removeEndedVendorGroups(planDir, true)
+                  )
+                    throw new LockUnknownError(
+                      "vendor process group has not ended",
+                    );
                   removeEmptyChild(
                     planDir,
                     `worker.v3.${encodeDirLockActor(opts.worker)}`,
                   );
+                  if (ctx.kind === "v" && childExists(planDir, "groups.v3"))
+                    removeEndedVendorGroups(planDir);
                 } finally {
                   close(planDir);
                 }
@@ -754,8 +785,16 @@ const acquireAttempt = (
         if (transaction && opts.worker) {
           const planDir = childDirectory(ctx.control, transaction);
           try {
+            if (
+              ctx.kind === "v" &&
+              childExists(planDir, "groups.v3") &&
+              !removeEndedVendorGroups(planDir, true)
+            )
+              throw new LockUnknownError("vendor process group has not ended");
             const worker = `worker.v3.${encodeDirLockActor(opts.worker)}`;
             if (childExists(planDir, worker)) removeEmptyChild(planDir, worker);
+            if (ctx.kind === "v" && childExists(planDir, "groups.v3"))
+              removeEndedVendorGroups(planDir);
           } finally {
             close(planDir);
           }

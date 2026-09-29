@@ -9,6 +9,7 @@ import {
   runLaunchPublisher,
 } from "./dir-lock-launch";
 import { writeLockReply as writeResponse } from "./dir-lock-reply";
+import { registerVendorGroup } from "./dir-lock-vendor";
 import { processIdentityStatus, processStartIdentity } from "./local-runtime";
 
 const helperCodec = (kind: string): TDirLockCodec => ({
@@ -31,6 +32,14 @@ export const runInternalLockControl = async (
   args: readonly string[],
 ): Promise<number> => {
   if (process.platform === "win32") return 74;
+  if (args[0] === "vendor-group") {
+    if (args.length !== 3 || !/^[1-9][0-9]{0,9}$/.test(args[2] ?? "")) return 2;
+    try {
+      return registerVendorGroup(args[1] ?? "", Number(args[2]));
+    } catch (error) {
+      return error instanceof LegacyLockError ? 73 : 74;
+    }
+  }
   if (args[0] === "launch") {
     if (args.length !== 4) return 2;
     const [, marker, mode, ready] = args;

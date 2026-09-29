@@ -167,6 +167,7 @@ function loadNative() {
     },
     fcntl: { args: [FFIType.i32, FFIType.i32], returns: FFIType.i32 },
     flock: { args: [FFIType.i32, FFIType.i32], returns: FFIType.i32 },
+    getpgrp: { args: [], returns: FFIType.i32 },
     closedir: { args: [FFIType.ptr], returns: FFIType.i32 },
     memset: {
       args: [FFIType.ptr, FFIType.i32, FFIType.u64],
@@ -183,6 +184,13 @@ function n(): TNative {
   native ??= loadNative();
   return native;
 }
+
+export const currentProcessGroup = (): number => {
+  const pid = n().symbols.getpgrp();
+  if (pid <= 1 || pid > 2147483647)
+    throw new Error("dir-lock-fs: invalid process group");
+  return pid;
+};
 
 function cString(value: string): Uint8Array {
   return Buffer.from(`${value}\0`, "utf8");
