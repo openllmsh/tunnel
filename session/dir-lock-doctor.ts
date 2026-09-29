@@ -336,10 +336,10 @@ const processView = (
     if (observed.state === "dead") continue;
     if (observed.uid !== null && observed.uid !== ownUid) continue;
     if (
-      (observed.kind === "shell" || observed.kind === "install-script") &&
-      (observed.uid === null ||
-        observed.state === "unknown" ||
-        observed.argv === null)
+      observed.uid === null ||
+      observed.state === "unknown" ||
+      observed.kind === "unknown" ||
+      observed.argv === null
     ) {
       blockers.push(`incomplete process evidence for PID ${pid}`);
       continue;
