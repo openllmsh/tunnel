@@ -75,6 +75,7 @@ export type TDoctorReport = {
   readonly code: 0 | 2 | 73 | 74;
   readonly status:
     | "cleared"
+    | "not-applicable"
     | "invalid-arguments"
     | "LEGACY_CLEAR_REFUSED"
     | "LEGACY_CLEAR_INCOMPLETE";
@@ -1363,8 +1364,10 @@ export const runLegacyLockDoctor = async (
 ): Promise<number> => {
   const json = args.includes("--json");
   if (process.platform === "win32") {
-    const report = {
+    // Exit 0 keeps callers working. The status tells them nothing was cleared.
+    const report: TDoctorReport = {
       ...emptyReport(),
+      status: "not-applicable",
       detectorLimits: ["legacy lock clearance is not applicable on Windows"],
     };
     console.log(

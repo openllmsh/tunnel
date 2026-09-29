@@ -1,13 +1,7 @@
-import {
-  lstatSync,
-  readFileSync,
-  renameSync,
-  unlinkSync,
-  writeFileSync,
-} from "node:fs";
+import { lstatSync, readFileSync } from "node:fs";
 import { isAbsolute } from "node:path";
 import type { TDirLockCodec } from "./dir-lock";
-import { acquireDirLockSync, envDirLockCodec } from "./dir-lock";
+import { acquireDirLockSync } from "./dir-lock";
 import { LegacyLockError, lockNonce } from "./dir-lock-control";
 import {
   associateLaunchChild,
@@ -35,29 +29,17 @@ const envLockMs = (name: string, fallback: number): number => {
     : fallback;
 };
 const writeResponse = (path: string, code: number): void => {
-  if (process.platform !== "win32") {
-    writeLockReply(path, code);
-    return;
-  }
-  const temporary = `${path}.v3.${lockNonce()}.tmp`;
-  try {
-    writeFileSync(temporary, `${JSON.stringify({ version: 3, code })}\n`, {
-      flag: "wx",
-      mode: 0o600,
-    });
-    renameSync(temporary, path);
-  } finally {
-    try {
-      unlinkSync(temporary);
-    } catch {
-      // The reply was moved or the first error is still active.
-    }
-  }
+  writeLockReply(path, code);
 };
 export const runInternalLockControl = async (
   args: readonly string[],
 ): Promise<number> => {
-  if (process.platform === "win32" && args[0] !== "e") return 74;
+  // The POSIX lock protocol does not apply on Windows (design v9.1 §1). The
+  // Bash installers never run there. Refuse before any lock or FFI work.
+  if (process.platform === "win32") {
+    process.stderr.write("lock helper is not applicable on Windows\n");
+    return 74;
+  }
   if (args[0] === "vendor-group") {
     if (args.length !== 3 || !/^[1-9][0-9]{0,9}$/.test(args[2] ?? "")) return 2;
     try {
@@ -122,34 +104,28 @@ export const runInternalLockControl = async (
   process.on("SIGHUP", ignoreHup);
   let release: (() => void) | null = null;
   try {
-    release = acquireDirLockSync(
-      path,
-      process.platform === "win32" ? envDirLockCodec : helperCodec(kind),
-      {
-        waitMs:
-          kind === "e"
-            ? envLockMs("OPENLLM_ENV_LOCK_WAIT_SECS", 10_000)
-            : 10_000,
-        reclaimMs: 30_000,
-        ownerlessMs:
-          kind === "e"
-            ? envLockMs("OPENLLM_ENV_LOCK_ORPHAN_SECS", 30_000)
-            : 30_000,
-        pollMs: 25,
-        propagatePublishErrors: true,
-        worker,
-        onStep: (step, _path, owner): void => {
-          if (kind !== "v" || !launchMarker || !launchNonce) return;
-          if (step === "after-mkdir")
-            associateLaunchChild(launchMarker, path, launchNonce, worker);
-          if (step === "before-grant") {
-            if (!owner)
-              throw new Error("vendor owner is unavailable for launch handoff");
-            handoffLaunchChild(launchMarker, path, launchNonce, worker, owner);
-          }
-        },
+    release = acquireDirLockSync(path, helperCodec(kind), {
+      waitMs:
+        kind === "e" ? envLockMs("OPENLLM_ENV_LOCK_WAIT_SECS", 10_000) : 10_000,
+      reclaimMs: 30_000,
+      ownerlessMs:
+        kind === "e"
+          ? envLockMs("OPENLLM_ENV_LOCK_ORPHAN_SECS", 30_000)
+          : 30_000,
+      pollMs: 25,
+      propagatePublishErrors: true,
+      worker,
+      onStep: (step, _path, owner): void => {
+        if (kind !== "v" || !launchMarker || !launchNonce) return;
+        if (step === "after-mkdir")
+          associateLaunchChild(launchMarker, path, launchNonce, worker);
+        if (step === "before-grant") {
+          if (!owner)
+            throw new Error("vendor owner is unavailable for launch handoff");
+          handoffLaunchChild(launchMarker, path, launchNonce, worker, owner);
+        }
       },
-    );
+    });
     if (release === null) {
       writeResponse(response, 74);
       return 74;
@@ -167,7 +143,7 @@ export const runInternalLockControl = async (
         if (
           !stat.isFile() ||
           stat.isSymbolicLink() ||
-          (process.platform !== "win32" && stat.uid !== process.getuid?.()) ||
+          stat.uid !== process.getuid?.() ||
           stat.size > 32
         )
           return 74;
