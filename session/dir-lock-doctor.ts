@@ -1077,6 +1077,18 @@ export const clearLegacyLocks = (
           if (completed === null) return false;
           removeCompletedControls(ctx, completed);
           for (const name of checkedNames(hold, 162)) {
+            if (!/^sample\.v3\.[0-9a-f]{32}\.tmp$/.test(name)) continue;
+            const published = `${name.slice(0, -4)}.json`;
+            if (childExists(hold, published)) {
+              removeLinkedRecordTemp(hold, name, published, 8192);
+            } else {
+              // A partial sample gives no cleanup authority.
+              // The gate excludes sample writers during this removal.
+              readRecord(hold, name, 8192);
+              unlinkChild(hold, name);
+            }
+          }
+          for (const name of checkedNames(hold, 162)) {
             if (SAMPLE.test(name)) {
               readRecord(hold, name, 8192);
               unlinkChild(hold, name);
