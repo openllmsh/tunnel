@@ -575,6 +575,14 @@ const allowedChild = (
   bytes: Buffer,
   anchor: boolean,
 ): string | null => {
+  if (name === "owner.v3" || /^owner\.v3\.[0-9a-f]{32}\.tmp$/.test(name)) {
+    const claim = parseDirLockOwnerRecord(bytes);
+    return claim !== null &&
+      (name === "owner.v3" || name === `owner.v3.${claim.nonce}.tmp`) &&
+      newClaimAssociation(ctx, bytes) === "terminal"
+      ? "terminal-copy"
+      : null;
+  }
   if (name === "owner") {
     if (parseDirLockOwnerRecord(bytes) !== null)
       return newClaimAssociation(ctx, bytes) === "terminal"
@@ -591,7 +599,10 @@ const allowedChild = (
         : null;
     return legacyJsonOwner(ctx.kind, bytes) ? "owner" : null;
   }
-  if (/^steal\.[1-9][0-9]{0,9}\.[0-9a-fA-F]+$/.test(name) && bytes.length === 0)
+  if (
+    /^steal\.[1-9][0-9]{0,9}\.[0-9a-fA-F]+$/.test(name) &&
+    bytes.length <= 1024
+  )
     return "guard";
   if (/^owner\.tmp\.[1-9][0-9]{0,9}$/.test(name) && bytes.length <= 1024)
     return "temp";
@@ -648,7 +659,6 @@ const makePlan = (ctx: TLockControl, target: string): TDoctorPlan | null => {
     const names = checkedNames(dir, 512);
     const entries: TDoctorEntry[] = [];
     for (const name of names) {
-      if (name.split(".").includes("v3")) return null;
       const bytes = readRecord(dir, name, 1024);
       const cleanupClass = allowedChild(ctx, name, bytes, target === ctx.base);
       if (cleanupClass === null) return null;
