@@ -51,6 +51,15 @@ import { inspectLegacyHold, namespaceSuffix } from "./dir-lock-legacy";
 import { processIdentityStatus, processStartIdentity } from "./local-runtime";
 
 const pendingReleases = new Map<string, TDirLockRelease>();
+const pendingCancellations = new Map<
+  string,
+  {
+    path: string;
+    claim: TDirLockClaim;
+    transaction: string | undefined;
+    worker: TDirLockOptions["worker"];
+  }
+>();
 const emptyObservations = new Map<
   string,
   { generation: string; elapsed: number; wall: number }
@@ -182,6 +191,23 @@ const terminalize = (
 ): void => {
   if (!isTerminal(ctx, claim))
     mkdirRecord(ctx.control, terminalName(claim, released));
+};
+const retryCancellations = (ctx: TLockControl): void => {
+  for (const [key, pending] of pendingCancellations) {
+    if (pending.path !== ctx.path) continue;
+    terminalize(ctx, pending.claim, false);
+    if (pending.transaction && pending.worker) {
+      const transaction = childDirectory(ctx.control, pending.transaction);
+      try {
+        const workerName = `worker.v3.${encodeDirLockActor(pending.worker)}`;
+        if (childExists(transaction, workerName))
+          removeEmptyChild(transaction, workerName);
+      } finally {
+        close(transaction);
+      }
+    }
+    pendingCancellations.delete(key);
+  }
 };
 const registerPlan = (
   ctx: TLockControl,
@@ -463,6 +489,7 @@ const acquireAttempt = (
   clock: TAttemptClock,
 ): TDirLockRelease | null =>
   withLockGate(ctx, () => {
+    retryCancellations(ctx);
     inspectLegacyHold(ctx);
     recoverControl(ctx, opts, clock.deadline);
     inspectLegacyHold(ctx);
@@ -486,6 +513,7 @@ const acquireAttempt = (
       }
     }
     if (
+      pendingCancellations.size >= 64 ||
       controls.filter((name) => name.startsWith("b.v3.")).length >= 64 ||
       controls.filter((name) => /^[cx]\.v3\./.test(name)).length >= 64 ||
       controls.filter((name) => name.startsWith("t.v3.")).length >= 256
@@ -683,6 +711,13 @@ const acquireAttempt = (
       };
       return release;
     } catch (error) {
+      const pendingKey = `${ctx.path}\0${claim.nonce}`;
+      pendingCancellations.set(pendingKey, {
+        path: ctx.path,
+        claim,
+        transaction,
+        worker: opts.worker,
+      });
       try {
         terminalize(ctx, claim, false);
         if (transaction && opts.worker) {
@@ -694,6 +729,7 @@ const acquireAttempt = (
             close(planDir);
           }
         }
+        pendingCancellations.delete(pendingKey);
         if (dir && transaction && generation)
           cleanupClaim(ctx, dir, claim, transaction, generation);
         else if (dir && generation) {
