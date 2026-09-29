@@ -468,6 +468,7 @@ export async function runLaunchPublisher(
   if (
     process.platform === "win32" ||
     !isAbsolute(markerPath) ||
+    !markerPath.endsWith(".launch.v3") ||
     (mode !== "mixed" && mode !== "new-only") ||
     !Number.isSafeInteger(handoffWaitMs) ||
     handoffWaitMs < 1 ||
@@ -478,6 +479,20 @@ export async function runLaunchPublisher(
   process.on("SIGHUP", ignoreHup);
   const ctx = openLockControl(markerPath, "a");
   try {
+    const vendor = openLockControl(
+      markerPath.replace(/\.launch\.v3$/, ".pid.d"),
+      "v",
+    );
+    try {
+      const checked = withLockGate(vendor, () => {
+        inspectLegacyHold(vendor);
+        return true;
+      });
+      if (checked !== true)
+        throw new LockUnknownError("vendor metadata gate is busy");
+    } finally {
+      closeLockControl(vendor);
+    }
     let published: { claim: TDirLockClaim; transactionName: string } | null =
       null;
     const deadline = performance.now() + 10_000;
