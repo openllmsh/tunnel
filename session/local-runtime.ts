@@ -147,6 +147,7 @@ const linuxProcStartTicks = (pid: number): number | null | undefined => {
     return procfsMounted() ? null : undefined;
   }
   const afterComm = stat.slice(stat.lastIndexOf(") ") + 2).split(" ");
+  if (afterComm[0] === "Z" || afterComm[0] === "X") return null;
   const ticks = Number(afterComm[19]);
   return Number.isSafeInteger(ticks) && ticks > 0 ? ticks : undefined;
 };
@@ -332,11 +333,12 @@ const windowsProcessStartIdentity = (
  */
 export const processStartIdentity = (
   pid: number,
+  budgetMs = 1500,
 ): string | null | undefined => {
   if (!Number.isSafeInteger(pid) || pid <= 0) return undefined;
   if (process.platform === "win32") return windowsProcessStartIdentity(pid);
   if (process.platform === "linux") return linuxBootScopedIdentity(pid);
-  return posixPsStartIdentity(pid);
+  return posixPsStartIdentity(pid, budgetMs);
 };
 
 /**
@@ -354,12 +356,16 @@ export const legacyProcessStartIdentity = (
   return posixPsStartIdentity(pid);
 };
 
-const posixPsStartIdentity = (pid: number): string | null | undefined => {
+const posixPsStartIdentity = (
+  pid: number,
+  budgetMs = 1500,
+): string | null | undefined => {
+  if (budgetMs <= 0) return undefined;
   const [bin, ...args] = processStartCommand(pid);
   if (bin === undefined) return undefined;
   const result = spawnSync(bin, args, {
     encoding: "utf8",
-    timeout: 1500,
+    timeout: Math.max(1, Math.min(1500, budgetMs)),
     windowsHide: true,
     env: { ...process.env, LC_ALL: "C", LANG: "C", TZ: "UTC" },
   });
