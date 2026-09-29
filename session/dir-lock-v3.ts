@@ -780,14 +780,21 @@ export const acquireDirLockV3Sync = (
   const poll = Math.max(1, opts.pollMs ?? 10);
   const attempts = 1 + Math.ceil(Math.max(0, opts.waitMs) / poll);
   const wait = new Int32Array(new SharedArrayBuffer(4));
+  let publishError: unknown;
   try {
     for (let index = 0; index < attempts; index++) {
-      release = acquireAttempt(ctx, opts, clock);
+      try {
+        release = acquireAttempt(ctx, opts, clock);
+      } catch (error) {
+        if (!["EIO", "ENOSPC"].includes(errorCode(error) ?? "")) throw error;
+        publishError ??= error;
+      }
       if (release) return release;
       const remaining = clock.deadline - clock.elapsed();
-      if (remaining <= 0) return null;
+      if (remaining <= 0) break;
       Atomics.wait(wait, 0, 0, Math.min(poll, remaining));
     }
+    if (publishError !== undefined) throw publishError;
     return null;
   } finally {
     if (!release) closeLockControl(ctx);
@@ -805,18 +812,25 @@ export const acquireDirLockV3 = async (
   let release: TDirLockRelease | null = null;
   const poll = Math.max(1, opts.pollMs ?? 50);
   const attempts = 1 + Math.ceil(Math.max(0, opts.waitMs) / poll);
+  let publishError: unknown;
   try {
     for (let index = 0; index < attempts; index++) {
-      release = acquireAttempt(ctx, opts, clock);
+      try {
+        release = acquireAttempt(ctx, opts, clock);
+      } catch (error) {
+        if (!["EIO", "ENOSPC"].includes(errorCode(error) ?? "")) throw error;
+        publishError ??= error;
+      }
       if (release) return release;
       const remaining = clock.deadline - clock.elapsed();
-      if (remaining <= 0) return null;
+      if (remaining <= 0) break;
       await (
         opts.sleep ??
         ((ms: number): Promise<void> =>
           new Promise((resolve) => setTimeout(resolve, ms)))
       )(Math.min(poll, remaining));
     }
+    if (publishError !== undefined) throw publishError;
     return null;
   } finally {
     if (!release) closeLockControl(ctx);
