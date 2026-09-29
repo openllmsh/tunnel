@@ -569,7 +569,10 @@ export const sameLegacyArtifact = (
   sample.pid === artifact.pid;
 
 /** Called under the metadata gate. Failed reading still persists hold first. */
-export const inspectLegacyHold = (ctx: TLockControl): void => {
+export const inspectLegacyHold = (
+  ctx: TLockControl,
+  observe: (pid: number) => TLegacyProcessObservation = observeLegacyProcess,
+): void => {
   const held = childExists(ctx.control, "legacy.v3.hold");
   let artifacts: TLegacyArtifact[];
   try {
@@ -601,7 +604,7 @@ export const inspectLegacyHold = (ctx: TLockControl): void => {
         close(overflow);
         break;
       }
-      const observation = observeLegacyProcess(artifact.pid);
+      const observation = observe(artifact.pid);
       const sample: TLegacySample = {
         version: 3,
         domain: ctx.path,

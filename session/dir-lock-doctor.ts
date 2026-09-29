@@ -43,6 +43,7 @@ import type {
   TLegacySample,
 } from "./dir-lock-legacy";
 import {
+  classifyLegacyProcessKind,
   inspectLegacyHold,
   loadLegacySamples,
   namespaceSuffix,
@@ -287,13 +288,36 @@ const listLinuxPids = (): number[] => {
   }
   return pids;
 };
-const processView = (deadline: number): TProcessView => {
-  const pids =
+export type TDoctorProcessDeps = {
+  readonly observe: (pid: number) => TLegacyProcessObservation;
+  readonly listPids: () => readonly number[] | null;
+  readonly recordedStatus: (
+    pid: number,
+    start: string,
+    budget: number,
+  ) => "alive" | "dead" | "unknown";
+};
+const realProcessDeps: TDoctorProcessDeps = {
+  observe: observeLegacyProcess,
+  listPids: () =>
     process.platform === "linux"
       ? listLinuxPids()
       : process.platform === "darwin"
         ? listDarwinPids()
-        : null;
+        : null,
+  recordedStatus: (pid, start, budget) =>
+    processIdentityStatus(
+      pid,
+      start,
+      (id) => processStartIdentity(id, budget),
+      (id) => legacyProcessStartIdentity(id, budget),
+    ),
+};
+const processView = (
+  deadline: number,
+  deps: TDoctorProcessDeps,
+): TProcessView => {
+  const pids = deps.listPids();
   if (pids === null || pids.length > 32768)
     throw new Error("unsupported or incomplete process enumeration");
   const byPid = new Map<number, TLegacyProcessObservation>();
@@ -304,21 +328,21 @@ const processView = (deadline: number): TProcessView => {
     if (performance.now() > deadline)
       throw new Error("doctor process-scan budget exhausted");
     if (pid === process.pid) continue;
-    let observed = observeLegacyProcess(pid);
-    if (observed.state === "unknown") observed = observeLegacyProcess(pid);
+    let observed = deps.observe(pid);
+    if (observed.state === "unknown") observed = deps.observe(pid);
     byPid.set(pid, observed);
     if (observed.state === "dead") continue;
     if (observed.uid !== null && observed.uid !== ownUid) continue;
     if (
-      observed.uid === null ||
-      observed.state === "unknown" ||
-      observed.kind === "unknown" ||
-      observed.argv === null
+      (observed.kind === "shell" || observed.kind === "install-script") &&
+      (observed.uid === null ||
+        observed.state === "unknown" ||
+        observed.argv === null)
     ) {
       blockers.push(`incomplete process evidence for PID ${pid}`);
       continue;
     }
-    if (isInstallerCommand(observed.argv)) {
+    if (observed.argv !== null && isInstallerCommand(observed.argv)) {
       installerPids.push(pid);
       blockers.push(
         `live installer PID ${pid} (${observed.comm ?? "unknown"})`,
@@ -357,6 +381,7 @@ const evaluateSamples = (
   view: TProcessView,
   overflow: boolean,
   deadline: number,
+  deps: TDoctorProcessDeps,
 ): {
   blockers: string[];
   excluded: { pid: number; comm: string }[];
@@ -395,7 +420,7 @@ const evaluateSamples = (
         continue;
       }
       const current =
-        view.byPid.get(artifact.pid) ?? observeLegacyProcess(artifact.pid);
+        view.byPid.get(artifact.pid) ?? deps.observe(artifact.pid);
       if (
         current.state === "dead" ||
         (current.uid !== null && current.uid !== process.getuid?.())
@@ -410,8 +435,7 @@ const evaluateSamples = (
       continue;
     }
     if (sample.capturedIdentity === "dead") continue;
-    const current =
-      view.byPid.get(sample.pid) ?? observeLegacyProcess(sample.pid);
+    const current = view.byPid.get(sample.pid) ?? deps.observe(sample.pid);
     if (
       current.state === "dead" ||
       (current.uid !== null && current.uid !== process.getuid?.())
@@ -435,12 +459,7 @@ const evaluateSamples = (
         Math.min(1500, Math.max(0, deadline - performance.now()));
       if (
         remaining() > 0 &&
-        processIdentityStatus(
-          sample.pid,
-          recordedStart,
-          (pid) => processStartIdentity(pid, remaining()),
-          (pid) => legacyProcessStartIdentity(pid, remaining()),
-        ) === "dead"
+        deps.recordedStatus(sample.pid, recordedStart, remaining()) === "dead"
       )
         continue;
     }
@@ -831,6 +850,11 @@ const removeIntent = (hold: TDirectoryHandle, name: string): void => {
 
 export const clearLegacyLocks = (
   domains: readonly TDoctorDomain[],
+  deps: TDoctorProcessDeps = realProcessDeps,
+  options: {
+    readonly sampleOnly?: boolean;
+    readonly actors?: readonly number[];
+  } = {},
 ): TDoctorReport => {
   let report = emptyReport();
   const deadline = performance.now() + 30000;
@@ -850,7 +874,7 @@ export const clearLegacyLocks = (
       contexts.push(ctx);
       const observed = withLockGate(ctx, () => {
         try {
-          inspectLegacyHold(ctx);
+          inspectLegacyHold(ctx, deps.observe);
         } catch (error) {
           if (!(error instanceof LegacyLockError)) throw error;
         }
@@ -862,9 +886,22 @@ export const clearLegacyLocks = (
         };
     }
     if (report.refused.length) return withCode(report, 73);
+    if (options.sampleOnly) return report;
     if (!contexts.some((ctx) => childExists(ctx.control, "legacy.v3.hold")))
       return report;
-    let view = processView(deadline);
+    const currentView = (): TProcessView => {
+      const view = processView(deadline, deps);
+      for (const pid of options.actors ?? []) {
+        const observed = deps.observe(pid);
+        if (observed.state === "dead") continue;
+        if (observed.state === "live" && observed.kind === "other") continue;
+        view.blockers.push(
+          `close process PID ${pid} (${observed.comm ?? "unknown"}) before retrying doctor; it may be an older lock actor.`,
+        );
+      }
+      return view;
+    };
+    let view = currentView();
     if (view.blockers.length)
       return withCode({ ...report, refused: view.blockers }, 73);
     // Initial preflight across every domain. No target deletion until all pass.
@@ -882,6 +919,7 @@ export const clearLegacyLocks = (
           view,
           childExists(hold, "overflow.v3"),
           deadline,
+          deps,
         );
         report = {
           ...report,
@@ -922,7 +960,7 @@ export const clearLegacyLocks = (
         const hold = childDirectory(ctx.control, "legacy.v3.hold");
         try {
           const recheck = (): boolean => {
-            view = processView(deadline);
+            view = currentView();
             if (view.blockers.length) return false;
             const decision = evaluateSamples(
               ctx,
@@ -931,6 +969,7 @@ export const clearLegacyLocks = (
               view,
               childExists(hold, "overflow.v3"),
               deadline,
+              deps,
             );
             if (decision.blockers.length || decision.uncertain.length)
               return false;
@@ -1085,6 +1124,115 @@ export const stateLockParents = (root: string): readonly string[] => [
   join(root, "cli-install"),
 ];
 
+export type TDoctorClearArgs = {
+  readonly entry?: string;
+  readonly domains: readonly (
+    | TDoctorDomain
+    | { readonly kind: "env"; readonly envFile: string }
+    | { readonly kind: "launch"; readonly jobDir: string; readonly cmd: string }
+  )[];
+  readonly actors?: readonly number[];
+  readonly mode?: "clear" | "sample";
+  readonly onReport?: (report: TDoctorReport) => void;
+};
+export type TDoctorClearDeps = {
+  readonly pidAlive: (pid: number) => boolean;
+  readonly startIdentity: (pid: number) => string | null | undefined;
+  readonly startEpochMs?: (pid: number) => number | null | undefined;
+  readonly procInfo: (pid: number) => {
+    readonly comm: string | null;
+    readonly argv0: string | null;
+    readonly unreadable: boolean;
+  };
+  readonly emit: (record: Record<string, unknown>) => void;
+  readonly root: string;
+  readonly processes?: TDoctorProcessDeps;
+};
+
+/** Both command entrypoints use this clearance path. */
+export const doctorClearLegacyLocks = (
+  args: TDoctorClearArgs,
+  deps?: TDoctorClearDeps,
+): number => {
+  const injected: TDoctorProcessDeps | undefined = deps && {
+    listPids: () => [],
+    observe: (pid): TLegacyProcessObservation => {
+      const alive = deps.pidAlive(pid);
+      const identity = alive ? deps.startIdentity(pid) : null;
+      const info = alive ? deps.procInfo(pid) : null;
+      const argv = info?.argv0 === null || !info ? null : [info.argv0];
+      return {
+        state: alive ? "live" : "dead",
+        uid: process.getuid?.() ?? null,
+        identity: identity ?? null,
+        boot: identity?.startsWith("boot:")
+          ? (identity.split(":")[1] ?? null)
+          : null,
+        kind: info?.unreadable
+          ? "unknown"
+          : classifyLegacyProcessKind(info?.comm ?? null, argv),
+        comm: info?.comm ?? null,
+        argv,
+        parentPid: null,
+      };
+    },
+    recordedStatus: (pid, start) => {
+      if (!deps.pidAlive(pid)) return "dead";
+      const current = deps.startIdentity(pid);
+      return current === undefined || current === null
+        ? "unknown"
+        : current === start
+          ? "alive"
+          : "dead";
+    },
+  };
+  const processes = deps?.processes ?? injected ?? realProcessDeps;
+  const report = clearLegacyLocks(
+    args.domains.map((domain): TDoctorDomain => {
+      if (domain.kind === "env")
+        return { path: `${domain.envFile}.lock.d`, kind: "e" };
+      if (domain.kind === "launch")
+        return {
+          path: join(domain.jobDir, `${domain.cmd}.launch.v3`),
+          kind: "a",
+        };
+      return domain;
+    }),
+    processes,
+    { actors: args.actors, sampleOnly: args.mode === "sample" },
+  );
+  for (const reason of report.refused) {
+    const pid = Number(/PID ([0-9]+)/.exec(reason)?.[1]);
+    const observed = Number.isFinite(pid) ? processes.observe(pid) : null;
+    const runtime = [
+      observed?.comm,
+      observed?.argv?.[0] && basename(observed.argv[0]),
+    ].some((name) => ["bun", "bunx", "node"].includes(name ?? ""));
+    deps?.emit({
+      t: "doctor",
+      ev: "blocked-actor",
+      pid,
+      comm: observed?.comm,
+      kind:
+        observed?.kind === "unknown"
+          ? "unreadable"
+          : runtime
+            ? "js-runtime"
+            : observed?.kind,
+      detail: reason,
+    });
+  }
+  for (const actor of report.excludedByKind)
+    deps?.emit({ t: "doctor", ev: "excluded-by-kind", ...actor });
+  for (const path of report.removed)
+    deps?.emit({ t: "doctor", ev: "removed", path });
+  for (const path of report.retained)
+    deps?.emit({ t: "doctor", ev: "retained", path });
+  deps?.emit({ t: "doctor", ev: "verdict", verdict: report.status });
+  args.onReport?.(report);
+  return report.code;
+};
+
 export const runLegacyLockDoctor = async (
   args: readonly string[],
   defaultEnvFiles: readonly string[],
@@ -1149,12 +1297,14 @@ export const runLegacyLockDoctor = async (
     );
     return 2;
   }
-  let report: TDoctorReport;
+  let report: TDoctorReport = emptyReport();
   try {
-    report = clearLegacyLocks([
-      ...domains,
-      ...discoverKnownLockDomains(knownParentDirs),
-    ]);
+    doctorClearLegacyLocks({
+      domains: [...domains, ...discoverKnownLockDomains(knownParentDirs)],
+      onReport: (result): void => {
+        report = result;
+      },
+    });
   } catch (error) {
     report = withCode(
       {
