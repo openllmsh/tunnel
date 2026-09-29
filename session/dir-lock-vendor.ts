@@ -24,12 +24,17 @@ import {
   removeEmptyChild,
 } from "./dir-lock-fs";
 import { inspectLegacyHold } from "./dir-lock-legacy";
-import { processIdentityStatus } from "./local-runtime";
+import { processBootIdentity, processIdentityStatus } from "./local-runtime";
 
-const groupPid = (name: string): number | null => {
-  const match = /^group\.v3\.([1-9][0-9]{0,9})$/.exec(name);
+const parseGroup = (
+  name: string,
+): { readonly pid: number; readonly boot: string | undefined } | null => {
+  const match =
+    /^group\.v3\.([1-9][0-9]{0,9})(?:\.([0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}))?$/.exec(
+      name,
+    );
   const pid = Number(match?.[1]);
-  return match && pid > 1 && pid <= 2147483647 ? pid : null;
+  return match && pid > 1 && pid <= 2147483647 ? { pid, boot: match[2] } : null;
 };
 const groupEnded = (pid: number): boolean => {
   try {
@@ -44,14 +49,25 @@ const groupEnded = (pid: number): boolean => {
 export const removeEndedVendorGroups = (
   transaction: TDirectoryHandle,
   inspectOnly = false,
+  ownerStart?: string,
 ): boolean => {
   if (!childExists(transaction, "groups.v3")) return false;
   const groups = childDirectory(transaction, "groups.v3");
   try {
     const entries = checkedNames(groups, 1);
+    const currentBoot = processBootIdentity();
+    const claimBoot = /^boot:([0-9a-f-]{36}):[0-9]+$/.exec(
+      ownerStart ?? "",
+    )?.[1];
     for (const entry of entries) {
-      const pid = groupPid(entry);
-      if (pid === null || !groupEnded(pid)) return false;
+      const group = parseGroup(entry);
+      if (group === null) return false;
+      const recordedBoot = group.boot ?? claimBoot;
+      const previousBoot =
+        recordedBoot !== undefined &&
+        currentBoot !== undefined &&
+        recordedBoot !== currentBoot;
+      if (!previousBoot && !groupEnded(group.pid)) return false;
       const record = childDirectory(groups, entry);
       try {
         checkedNames(record, 0);
@@ -80,7 +96,9 @@ export const registerVendorGroup = (
     workerPid > 2147483647
   )
     return 2;
-  const name = `group.v3.${currentProcessGroup()}`;
+  const boot = processBootIdentity();
+  if (boot === undefined) return 74;
+  const name = `group.v3.${currentProcessGroup()}.${boot}`;
   const ctx = openLockControl(path, "v");
   try {
     return (

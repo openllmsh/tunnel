@@ -205,14 +205,14 @@ const retryCancellations = (ctx: TLockControl): void => {
         if (
           ctx.kind === "v" &&
           childExists(transaction, "groups.v3") &&
-          !removeEndedVendorGroups(transaction, true)
+          !removeEndedVendorGroups(transaction, true, pending.claim.start)
         )
           throw new LockUnknownError("vendor process group has not ended");
         const workerName = `worker.v3.${encodeDirLockActor(pending.worker)}`;
         if (childExists(transaction, workerName))
           removeEmptyChild(transaction, workerName);
         if (ctx.kind === "v" && childExists(transaction, "groups.v3"))
-          removeEndedVendorGroups(transaction);
+          removeEndedVendorGroups(transaction, false, pending.claim.start);
       } finally {
         close(transaction);
       }
@@ -410,7 +410,7 @@ const recoverControl = (
         entries.some(
           (entry) => entry.startsWith("worker.v3.") || entry === "groups.v3",
         ) &&
-        !removeEndedVendorGroups(transaction, true)
+        !removeEndedVendorGroups(transaction, true, claim.start)
       )
         continue;
       for (const entry of entries.filter((entry) =>
@@ -425,7 +425,7 @@ const recoverControl = (
         removeEmptyChild(transaction, entry);
       }
       if (ctx.kind === "v" && entries.includes("groups.v3"))
-        removeEndedVendorGroups(transaction);
+        removeEndedVendorGroups(transaction, false, claim.start);
       if (entries.includes("plan.v3.json")) {
         plan = parseDirLockPlan(readRecord(transaction, "plan.v3.json", 8192));
         if (plan === null)
@@ -722,7 +722,7 @@ const acquireAttempt = (
                   if (
                     ctx.kind === "v" &&
                     childExists(planDir, "groups.v3") &&
-                    !removeEndedVendorGroups(planDir, true)
+                    !removeEndedVendorGroups(planDir, true, claim.start)
                   )
                     throw new LockUnknownError(
                       "vendor process group has not ended",
@@ -732,7 +732,7 @@ const acquireAttempt = (
                     `worker.v3.${encodeDirLockActor(opts.worker)}`,
                   );
                   if (ctx.kind === "v" && childExists(planDir, "groups.v3"))
-                    removeEndedVendorGroups(planDir);
+                    removeEndedVendorGroups(planDir, false, claim.start);
                 } finally {
                   close(planDir);
                 }
@@ -788,13 +788,13 @@ const acquireAttempt = (
             if (
               ctx.kind === "v" &&
               childExists(planDir, "groups.v3") &&
-              !removeEndedVendorGroups(planDir, true)
+              !removeEndedVendorGroups(planDir, true, claim.start)
             )
               throw new LockUnknownError("vendor process group has not ended");
             const worker = `worker.v3.${encodeDirLockActor(opts.worker)}`;
             if (childExists(planDir, worker)) removeEmptyChild(planDir, worker);
             if (ctx.kind === "v" && childExists(planDir, "groups.v3"))
-              removeEndedVendorGroups(planDir);
+              removeEndedVendorGroups(planDir, false, claim.start);
           } finally {
             close(planDir);
           }

@@ -164,6 +164,30 @@ const linuxBootId = (): string | undefined => {
   }
 };
 
+/** Read the boot identity without a wall-clock comparison. */
+export const processBootIdentity = (): string | undefined => {
+  if (process.platform === "linux") return linuxBootId();
+  if (process.platform !== "darwin") return undefined;
+  try {
+    const result = spawnSync(
+      "/usr/sbin/sysctl",
+      ["-n", "kern.bootsessionuuid"],
+      {
+        encoding: "utf8",
+        timeout: 1500,
+        env: { ...process.env, LC_ALL: "C" },
+      },
+    );
+    if (result.error || result.status !== 0) return undefined;
+    const value = result.stdout.trim().toLowerCase();
+    return /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/.test(value)
+      ? value
+      : undefined;
+  } catch {
+    return undefined;
+  }
+};
+
 /**
  * The canonical Linux start identity: `boot:<boot_id>:<starttime_ticks>`.
  * `null` = confirmed dead (stat vanished), `undefined` = cannot determine.
