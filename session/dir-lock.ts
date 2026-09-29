@@ -642,15 +642,19 @@ const tryAcquireDirLockAttempt = (
     removeCreated(lockDir);
     return null;
   }
-  const owner: TDirLockOwner = {
-    kind: codec.kind,
-    pid: process.pid,
-    start:
-      (opts.ownerStartIdentity ?? opts.startIdentity ?? processStartIdentity)(
-        process.pid,
-      ) ?? "",
-    nonce: nonce(),
-  };
+  const owner: TDirLockOwner = opts.worker
+    ? { kind: codec.kind, ...opts.worker }
+    : {
+        kind: codec.kind,
+        pid: process.pid,
+        start:
+          (
+            opts.ownerStartIdentity ??
+            opts.startIdentity ??
+            processStartIdentity
+          )(process.pid) ?? "",
+        nonce: nonce(),
+      };
   if (owner.start.length === 0) {
     removeCreated(lockDir);
     return null;
