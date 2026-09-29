@@ -947,12 +947,12 @@ export const clearLegacyLocks = (
           { ...report, retained: add(report.retained, domain.path) },
           2,
         );
-      if (!existsSync(dirname(domain.path))) continue;
       let ctx: TLockControl;
       try {
         if (!hasDomainEvidence(domain)) continue;
         ctx = openLockControl(domain.path, domain.kind);
       } catch (error) {
+        if (errorCode(error) === "ENOENT") continue;
         if (!domain.optional) throw error;
         skipped.push(
           `unsafe optional client lock parent: ${dirname(domain.path)} (${error instanceof Error ? error.message : String(error)})`,
