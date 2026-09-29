@@ -151,7 +151,9 @@ export const runInternalLockControl = async (
           stat.size > 32
         )
           return 74;
-        if (readFileSync(request, "utf8") !== "release\n") return 2;
+        const action = readFileSync(request, "utf8");
+        if (kind === "v" && action === "preserve\n") return 74;
+        if (action !== "release\n") return 2;
         activeRelease();
         release = null;
         return 0;
