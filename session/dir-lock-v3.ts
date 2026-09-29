@@ -480,6 +480,42 @@ const recoverControl = (
     if (actorStatus(claim, opts) === "dead") collectClaim(ctx, claim);
   }
 };
+/**
+ * Find the reservation that a crash left between the lock directory mkdir
+ * and the plan registration. Its actor is dead. No transaction names its
+ * nonce or this lock generation. The reservation is not newer than the empty
+ * lock directory. Call this only under the metadata gate.
+ */
+const unplannedReservation = (
+  ctx: TLockControl,
+  controls: readonly string[],
+  generation: string,
+  dirMtimeMs: number,
+  opts: TDirLockOptions,
+): TDirLockClaim | null => {
+  const planned = new Set<string>();
+  for (const name of controls) {
+    const tx = parseDirLockTransactionName(name);
+    if (tx === null) continue;
+    if (tx.generation === generation) return null;
+    planned.add(tx.actor.nonce);
+  }
+  for (const name of controls) {
+    const match = /^b\.v3\.([eurva])\.(.+)$/.exec(name);
+    const actor = match ? decodeDirLockActor(match[2] ?? "") : null;
+    if (!actor || match?.[1] !== ctx.kind || planned.has(actor.nonce)) continue;
+    const claim: TDirLockClaim = { kind: ctx.kind, ...actor };
+    if (actorStatus(claim, opts) !== "dead") continue;
+    const record = childDirectory(ctx.control, name);
+    try {
+      if (Number(statDescriptor(record.fd).mtimeMs) > dirMtimeMs) continue;
+    } finally {
+      close(record);
+    }
+    return claim;
+  }
+  return null;
+};
 type TAttemptClock = {
   reentered?: boolean;
   readonly elapsed: () => number;
@@ -577,34 +613,51 @@ const acquireAttempt = (
           if (controls.some((name) => name.startsWith("t.v3."))) return null;
           const grace = opts.ownerlessMs ?? opts.reclaimMs;
           const generation = lockGeneration(dir);
-          let observed = emptyObservations.get(ctx.path);
-          if (
-            observed &&
-            (observed.generation !== generation ||
-              Math.abs(
-                clock.wall() -
-                  observed.wall -
-                  (clock.elapsed() - observed.elapsed),
-              ) > 1000)
-          ) {
-            emptyObservations.delete(ctx.path);
-            observed = undefined;
+          const mtimeMs = Number(statDescriptor(dir.fd).mtimeMs);
+          const wallAge = clock.wall() - mtimeMs;
+          const orphan = unplannedReservation(
+            ctx,
+            controls,
+            generation,
+            mtimeMs,
+            opts,
+          );
+          if (orphan !== null) {
+            // A crash between the lock mkdir and the plan registration left
+            // this empty directory. It stays held for the orphan bound by the
+            // lock clock. After the bound, any acquirer reclaims it. One
+            // process does not have to watch the full bound.
+            if (wallAge < grace) return null;
+          } else {
+            let observed = emptyObservations.get(ctx.path);
+            if (
+              observed &&
+              (observed.generation !== generation ||
+                Math.abs(
+                  clock.wall() -
+                    observed.wall -
+                    (clock.elapsed() - observed.elapsed),
+                ) > 1000)
+            ) {
+              emptyObservations.delete(ctx.path);
+              observed = undefined;
+            }
+            if (!observed) {
+              if (emptyObservations.size >= 64) return null;
+              observed = {
+                generation,
+                elapsed: clock.elapsed(),
+                wall: clock.wall(),
+              };
+              emptyObservations.set(ctx.path, observed);
+            }
+            if (wallAge < grace || clock.elapsed() - observed.elapsed < grace)
+              return null;
           }
-          if (!observed) {
-            if (emptyObservations.size >= 64) return null;
-            observed = {
-              generation,
-              elapsed: clock.elapsed(),
-              wall: clock.wall(),
-            };
-            emptyObservations.set(ctx.path, observed);
-          }
-          const wallAge = clock.wall() - Number(statDescriptor(dir.fd).mtimeMs);
-          if (wallAge < grace || clock.elapsed() - observed.elapsed < grace)
-            return null;
           if (!removeEmptyGeneration(ctx.parent, ctx.base, generation))
             return null;
           emptyObservations.delete(ctx.path);
+          if (orphan !== null) collectClaim(ctx, orphan);
         }
       } finally {
         close(dir);
