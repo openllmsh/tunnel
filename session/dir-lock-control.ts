@@ -1,5 +1,11 @@
 import { randomBytes } from "node:crypto";
-import { fsyncSync, readSync, writeFileSync } from "node:fs";
+import {
+  fsyncSync,
+  lstatSync,
+  readlinkSync,
+  readSync,
+  writeFileSync,
+} from "node:fs";
 import { basename, dirname, isAbsolute, resolve, sep } from "node:path";
 import type { TDirLockKind } from "./dir-lock-format";
 import {
@@ -175,12 +181,35 @@ export const ensureDirectory = (
   }
   return child;
 };
+const physicalSystemPath = (path: string): string => {
+  const normalized = resolve(path);
+  if (process.platform !== "darwin") return normalized;
+  for (const alias of ["var", "tmp", "etc"]) {
+    const prefix = `/${alias}`;
+    if (normalized !== prefix && !normalized.startsWith(`${prefix}/`)) continue;
+    const physical = `/private/${alias}`;
+    const link = lstatSync(prefix, { bigint: true });
+    const target = lstatSync(physical, { bigint: true });
+    const linkText = readlinkSync(prefix);
+    if (
+      !link.isSymbolicLink() ||
+      link.uid !== 0n ||
+      ![physical, `private/${alias}`].includes(linkText) ||
+      !target.isDirectory() ||
+      target.uid !== 0n
+    )
+      throw new LockUnknownError("untrusted system directory alias");
+    // Only these root-owned macOS aliases are permitted; later components stay O_NOFOLLOW.
+    return `${physical}${normalized.slice(prefix.length)}`;
+  }
+  return normalized;
+};
 export const openPinnedPath = (path: string): TDirectoryHandle => {
   if (!isAbsolute(path))
     throw new LockUnknownError("lock path must be absolute");
   let current = openDirectory(sep);
   try {
-    for (const name of resolve(path).split(sep).filter(Boolean)) {
+    for (const name of physicalSystemPath(path).split(sep).filter(Boolean)) {
       const next = childDirectory(current, name);
       close(current);
       current = next;

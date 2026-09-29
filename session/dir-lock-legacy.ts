@@ -1,5 +1,5 @@
-import { readFileSync, statSync } from "node:fs";
-import { basename } from "node:path";
+import { closeSync, openSync, readFileSync, readSync, statSync } from "node:fs";
+import { basename, isAbsolute } from "node:path";
 import type { TLockControl } from "./dir-lock-control";
 import {
   checkedNames,
@@ -14,6 +14,7 @@ import {
   writeRecord,
 } from "./dir-lock-control";
 import {
+  decodeDirLockBytes,
   encodeDirLockActor,
   formatDirLockGeneration,
   parseDirLockOwnerRecord,
@@ -153,7 +154,10 @@ export const namespaceSuffix = (
   if (name === ctx.base) return "";
   if (name.startsWith(`${ctx.base}.`)) {
     const suffix = name.slice(ctx.base.length + 1);
-    if (/^(?:steal-|rel-|stealing[.-]|releasing[.-])/.test(suffix))
+    if (
+      /^(?:steal-|rel-|stealing[.-]|releasing[.-])/.test(suffix) ||
+      (ctx.kind === "r" && suffix.startsWith("stale-"))
+    )
       return suffix;
   }
   if (ctx.kind === "e" || ctx.kind === "v") {
@@ -169,7 +173,7 @@ export const namespaceSuffix = (
 };
 const roleFor = (name: string): TLegacyArtifact["role"] => {
   if (name.startsWith("steal.")) return "guard actor";
-  if (/\.stale\.|\.steal-/.test(name)) return "quarantine creator";
+  if (/\.stale[.-]|\.steal-/.test(name)) return "quarantine creator";
   if (/\.rel\.|\.rel-/.test(name)) return "release actor";
   if (/\.stealing-|\.releasing-/.test(name)) return "shadow actor";
   if (/\.launch(?:\.|$)/.test(name)) return "launcher";
@@ -177,7 +181,7 @@ const roleFor = (name: string): TLegacyArtifact["role"] => {
 };
 const pidFor = (name: string, bytes: Buffer | null): number | null => {
   const named =
-    /(?:^steal\.|\.(?:stale\.|rel\.|steal-|rel-|stealing-|releasing-|parked-|tmp\.))([1-9][0-9]{0,9})(?:[.-]|$)/.exec(
+    /(?:^steal\.|\.(?:stale[.-]|rel\.|steal-|rel-|stealing-|releasing-|parked-|tmp\.))([1-9][0-9]{0,9})(?:[.-]|$)/.exec(
       name,
     )?.[1];
   if (named !== undefined) return namedPid(named);
@@ -355,6 +359,25 @@ export const classifyLegacyProcessKind = (
     return "install-script";
   return comm !== null && argv !== null ? "other" : "unknown";
 };
+const procArgv = (path: string): readonly string[] | null => {
+  const fd = openSync(path, "r");
+  try {
+    const bytes = Buffer.allocUnsafe(1048577);
+    let length = 0;
+    while (length < bytes.length) {
+      const count = readSync(fd, bytes, length, bytes.length - length, null);
+      if (count === 0) break;
+      length += count;
+    }
+    if (length === 0 || length > 1048576 || bytes[length - 1] !== 0)
+      return null;
+    return new TextDecoder("utf-8", { fatal: true })
+      .decode(bytes.subarray(0, length - 1))
+      .split("\0");
+  } finally {
+    closeSync(fd);
+  }
+};
 /** Capture identity, terminal state, and kind from one Linux process generation. */
 export const observeLegacyProcess = (
   pid: number,
@@ -440,13 +463,7 @@ export const observeLegacyProcess = (
     /* Kind remains unknown. */
   }
   try {
-    const data = readFileSync(`${path}/cmdline`);
-    if (
-      data.byteLength <= 1048576 &&
-      data.byteLength > 0 &&
-      data[data.byteLength - 1] === 0
-    )
-      argv = data.toString("utf8").split("\0").slice(0, -1);
+    argv = procArgv(`${path}/cmdline`);
   } catch {
     /* Kind remains unknown. */
   }
@@ -488,19 +505,37 @@ export const parseLegacySample = (bytes: Buffer): TLegacySample | null => {
     !exact(value, SAMPLE_KEYS) ||
     value.version !== 3 ||
     typeof value.domain !== "string" ||
+    !isAbsolute(value.domain) ||
     !isGeneration(value.parentGeneration) ||
     typeof value.relativePath !== "string" ||
+    value.relativePath.split("/").length > 2 ||
+    !value.relativePath
+      .split("/")
+      .every(
+        (part) =>
+          part.length > 0 &&
+          part !== "." &&
+          part !== ".." &&
+          Buffer.byteLength(part) <= 255,
+      ) ||
     !isGeneration(value.artifactGeneration) ||
     (value.artifactType !== "regular" && value.artifactType !== "directory") ||
     !record(value.artifactEvidence) ||
     !exact(value.artifactEvidence, ["name", "bytes"]) ||
     typeof value.artifactEvidence.name !== "string" ||
+    value.artifactEvidence.name.includes("/") ||
     (value.artifactEvidence.bytes !== null &&
-      typeof value.artifactEvidence.bytes !== "string") ||
+      (typeof value.artifactEvidence.bytes !== "string" ||
+        decodeDirLockBytes(value.artifactEvidence.bytes) === null)) ||
+    (value.artifactType === "regular" &&
+      value.artifactEvidence.bytes === null) ||
+    (value.artifactType === "directory" &&
+      value.artifactEvidence.bytes !== null) ||
     !ROLES.has(value.role as TLegacyArtifact["role"]) ||
     typeof value.pid !== "number" ||
     !validPid(value.pid) ||
     typeof value.capturedIdentity !== "string" ||
+    value.capturedIdentity.length > 64 ||
     (value.captureBoot !== null && typeof value.captureBoot !== "string") ||
     !KINDS.has(value.capturedKind as TLegacyProcessKind) ||
     (value.capturedComm !== null && typeof value.capturedComm !== "string")
@@ -552,7 +587,9 @@ export const inspectLegacyHold = (ctx: TLockControl): void => {
       if (
         artifact.pid === null ||
         artifact.artifactGeneration === null ||
-        artifact.artifactType === "unknown"
+        artifact.artifactType === "unknown" ||
+        (artifact.artifactType === "regular" &&
+          artifact.artifactEvidence.bytes === null)
       )
         continue;
       if (

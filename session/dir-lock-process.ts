@@ -2,7 +2,6 @@ import { mkdtempSync, rmdirSync, unlinkSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import source from "./dir-lock-process.c" with { type: "text" };
-import { processStartIdentity } from "./local-runtime";
 
 export type TDarwinProcessSnapshot = {
   readonly state: "live" | "dead" | "unknown";
@@ -98,8 +97,15 @@ export const observeDarwinProcess = (pid: number): TDarwinProcessSnapshot => {
   const uid = view.getUint32(0, true);
   const parentPid = view.getUint32(4, true);
   const status = view.getUint32(8, true);
-  if (status === 5)
-    return { ...unknown, state: "dead", uid, parentPid };
+  if (status === 5) return { ...unknown, state: "dead", uid, parentPid };
+  const startSeconds = view.getBigInt64(12, true);
+  const startMicroseconds = view.getBigInt64(20, true);
+  if (
+    startSeconds <= 0n ||
+    startMicroseconds < 0n ||
+    startMicroseconds >= 1000000n
+  )
+    return { ...unknown, uid, parentPid };
   let comm: string | null = null;
   try {
     comm = utf8.decode(first.subarray(28, 44)).split("\0")[0] || null;
@@ -122,12 +128,11 @@ export const observeDarwinProcess = (pid: number): TDarwinProcessSnapshot => {
     !first.subarray(0, 28).every((byte, index) => byte === second[index])
   )
     return { ...unknown, uid, parentPid };
-  const identity = processStartIdentity(pid);
   return {
     state: "live",
     uid,
     parentPid,
-    identity: typeof identity === "string" ? identity : null,
+    identity: `darwin:${startSeconds}:${startMicroseconds}`,
     comm,
     argv,
   };
