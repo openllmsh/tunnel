@@ -1301,6 +1301,18 @@ export const runLegacyLockDoctor = async (
   knownParentDirs: readonly string[] = [],
 ): Promise<number> => {
   const json = args.includes("--json");
+  if (process.platform === "win32") {
+    const report = {
+      ...emptyReport(),
+      detectorLimits: ["legacy lock clearance is not applicable on Windows"],
+    };
+    console.log(
+      json
+        ? JSON.stringify(report)
+        : "not applicable on Windows: legacy lock clearance uses POSIX locks",
+    );
+    return report.code;
+  }
   const domains: TDoctorDomain[] = [
     ...defaultEnvFiles.map((path) => ({
       path: `${path}.lock.d`,
