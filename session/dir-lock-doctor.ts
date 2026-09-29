@@ -617,6 +617,21 @@ const allowedChild = (
 };
 const parentTarget = (ctx: TLockControl, name: string): boolean =>
   namespaceSuffix(ctx, name) !== null;
+const supportedDirectoryTarget = (ctx: TLockControl, name: string): boolean => {
+  if (name === ctx.base) return true;
+  const suffix = namespaceSuffix(ctx, name);
+  if (suffix === null || suffix === "") return false;
+  if (
+    /^(?:steal-|rel-|stealing-|releasing-)[1-9][0-9]{0,9}-[0-9a-fA-F]{32}$/.test(
+      suffix,
+    )
+  )
+    return true;
+  if (/^stale\.[1-9][0-9]{0,9}\.[0-9a-fA-F]+\.[0-9]+$/.test(suffix))
+    return true;
+  if (/^rel\.[1-9][0-9]{0,9}\.[0-9a-fA-F]+$/.test(suffix)) return true;
+  return /^parked-[1-9][0-9]{0,9}\.[0-9]+$/.test(suffix);
+};
 const emptyAnchor = (ctx: TLockControl, name: string): boolean => {
   if (name !== ctx.base) return false;
   try {
@@ -658,6 +673,7 @@ const makePlan = (ctx: TLockControl, target: string): TDoctorPlan | null => {
     };
   }
   try {
+    if (!supportedDirectoryTarget(ctx, target)) return null;
     const names = checkedNames(dir, 512);
     const entries: TDoctorEntry[] = [];
     for (const name of names) {
@@ -795,7 +811,9 @@ const applyPlan = (
 ): boolean => {
   if (
     plan.parentGeneration !== lockGeneration(ctx.parent) ||
-    !parentTarget(ctx, plan.target)
+    !parentTarget(ctx, plan.target) ||
+    (plan.targetType === "directory" &&
+      !supportedDirectoryTarget(ctx, plan.target))
   )
     return false;
   if (plan.targetType === "regular") {
