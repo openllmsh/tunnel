@@ -51,6 +51,7 @@ import { inspectLegacyHold, namespaceSuffix } from "./dir-lock-legacy";
 import { processIdentityStatus, processStartIdentity } from "./local-runtime";
 
 const pendingReleases = new Map<string, TDirLockRelease>();
+const activeClaims = new Set<string>();
 const pendingCancellations = new Map<
   string,
   {
@@ -458,6 +459,7 @@ const recoverControl = (
   }
 };
 type TAttemptClock = {
+  reentered?: boolean;
   readonly elapsed: () => number;
   readonly wall: () => number;
   readonly deadline: number;
@@ -528,6 +530,10 @@ const acquireAttempt = (
         const owner = observePinnedOwner(dir, ctx.kind);
         if (owner.state === "unreadable") return null;
         if (owner.state === "valid") {
+          if (activeClaims.has(encodeDirLockActor(owner.claim))) {
+            clock.reentered = true;
+            return null;
+          }
           // Published owners need their exact publication transaction.
           const generation = lockGeneration(dir);
           const transaction = formatDirLockTransactionName({
@@ -669,12 +675,15 @@ const acquireAttempt = (
         throw new LockUnknownError("publication evidence changed");
       opts.onStep?.("before-grant", ctx.path, claim);
       granted = true;
+      const activeClaim = encodeDirLockActor(claim);
+      activeClaims.add(activeClaim);
       const capturedDir = dir;
       const capturedTransaction = transaction;
       const capturedGeneration = generation;
       let done = false;
       const release = (): void => {
         if (done) return;
+        activeClaims.delete(activeClaim);
         let terminalPublished = false;
         try {
           const start = performance.now();
@@ -790,6 +799,7 @@ export const acquireDirLockV3Sync = (
         publishError ??= error;
       }
       if (release) return release;
+      if (clock.reentered) return null;
       const remaining = clock.deadline - clock.elapsed();
       if (remaining <= 0) break;
       Atomics.wait(wait, 0, 0, Math.min(poll, remaining));
@@ -822,6 +832,7 @@ export const acquireDirLockV3 = async (
         publishError ??= error;
       }
       if (release) return release;
+      if (clock.reentered) return null;
       const remaining = clock.deadline - clock.elapsed();
       if (remaining <= 0) break;
       await (
