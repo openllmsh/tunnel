@@ -25,6 +25,14 @@ const helperCodec = (kind: string): TDirLockCodec => ({
     throw new Error("the v3 core owns serialization");
   },
 });
+const envLockMs = (name: string, fallback: number): number => {
+  const value = process.env[name];
+  const seconds =
+    value !== undefined && /^[0-9]+$/.test(value) ? Number(value) : 0;
+  return Number.isSafeInteger(seconds) && seconds > 0 && seconds <= 3600
+    ? seconds * 1000
+    : fallback;
+};
 const writeResponse = (path: string, code: number): void => {
   const fd = openSync(
     path,
@@ -101,8 +109,13 @@ export const runInternalLockControl = async (
   let release: (() => void) | null = null;
   try {
     release = acquireDirLockSync(path, helperCodec(kind), {
-      waitMs: 10_000,
+      waitMs:
+        kind === "e" ? envLockMs("OPENLLM_ENV_LOCK_WAIT_SECS", 10_000) : 10_000,
       reclaimMs: 30_000,
+      ownerlessMs:
+        kind === "e"
+          ? envLockMs("OPENLLM_ENV_LOCK_ORPHAN_SECS", 30_000)
+          : 30_000,
       pollMs: 25,
       propagatePublishErrors: true,
       worker,
