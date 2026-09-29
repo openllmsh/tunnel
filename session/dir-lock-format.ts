@@ -247,7 +247,7 @@ const hasDuplicateJsonKeys = (source: string): boolean => {
   return duplicate;
 };
 
-const parseStrictJson = (
+export const parseStrictDirLockJson = (
   input: Uint8Array | string,
   maxBytes: number,
 ): unknown | null => {
@@ -268,7 +268,7 @@ const parseStrictJson = (
 export const parseDirLockOwnerRecord = (
   input: Uint8Array | string,
 ): TDirLockOwnerRecord | null => {
-  const value = parseStrictJson(input, DIR_LOCK_LIMITS.ownerBytes);
+  const value = parseStrictDirLockJson(input, DIR_LOCK_LIMITS.ownerBytes);
   if (
     !ownRecord(value) ||
     !hasExactKeys(value, ["version", "kind", "pid", "start", "nonce"]) ||
@@ -304,7 +304,7 @@ export const serializeDirLockOwnerRecord = (claim: TDirLockClaim): string => {
 export const parseDirLockPlan = (
   input: Uint8Array | string,
 ): TDirLockPlan | null => {
-  const value = parseStrictJson(input, DIR_LOCK_LIMITS.planBytes);
+  const value = parseStrictDirLockJson(input, DIR_LOCK_LIMITS.planBytes);
   if (
     !ownRecord(value) ||
     !hasExactKeys(value, [

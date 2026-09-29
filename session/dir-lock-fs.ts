@@ -1,5 +1,6 @@
 import type { BigIntStats } from "node:fs";
 import { closeSync, fstatSync } from "node:fs";
+import { join } from "node:path";
 
 export type TDirectoryGeneration = Readonly<{ dev: bigint; ino: bigint }>;
 export type TDirectoryHandle = {
@@ -9,11 +10,42 @@ export type TDirectoryHandle = {
 };
 export type TFileHandle = { readonly fd: number; closed: boolean };
 export type TNativeHandle = TDirectoryHandle | TFileHandle;
+export type TDirLockFsEvent = Readonly<{
+  phase: "before" | "after";
+  operation:
+    | "openDirectory"
+    | "openDirectoryChild"
+    | "openChild"
+    | "mkdirChild"
+    | "linkChild"
+    | "unlinkChild"
+    | "removeEmptyChild"
+    | "listDirectory";
+  path?: string;
+  name?: string;
+  dirFd?: number;
+  fd?: number;
+}>;
+let testHook: ((event: TDirLockFsEvent) => void) | null = null;
+const fdPaths = new Map<number, string>();
+export function setDirLockFsHookForTests(
+  hook: ((event: TDirLockFsEvent) => void) | null,
+): void {
+  testHook = hook;
+}
+function emit(event: TDirLockFsEvent): void {
+  testHook?.(event);
+}
+function childPath(dir: TDirectoryHandle, name: string): string | undefined {
+  const parent = fdPaths.get(dir.fd);
+  return parent === undefined ? undefined : join(parent, name);
+}
 
 type TNativeFlags = Readonly<{
   O_RDONLY: number;
   O_WRONLY: number;
   O_RDWR: number;
+  O_NONBLOCK: number;
   O_CREAT: number;
   O_EXCL: number;
   O_DIRECTORY: number;
@@ -26,6 +58,7 @@ const linuxX64: TNativeFlags = {
   O_RDONLY: 0,
   O_WRONLY: 1,
   O_RDWR: 2,
+  O_NONBLOCK: 0x800,
   O_CREAT: 0x40,
   O_EXCL: 0x80,
   O_DIRECTORY: 0x10000,
@@ -42,6 +75,7 @@ const darwin: TNativeFlags = {
   O_RDONLY: 0,
   O_WRONLY: 1,
   O_RDWR: 2,
+  O_NONBLOCK: 0x4,
   O_CREAT: 0x200,
   O_EXCL: 0x800,
   O_DIRECTORY: 0x100000,
@@ -222,6 +256,7 @@ function withNewFd<T>(fd: number, operation: (fd: number) => T): T {
   try {
     return operation(fd);
   } catch (error) {
+    fdPaths.delete(fd);
     try {
       closeSync(fd);
     } catch {
@@ -254,6 +289,7 @@ export function openDirectory(path: string): TDirectoryHandle {
   const v = n();
   const f = v.abi.flags;
   const bytes = cString(path);
+  emit({ phase: "before", operation: "openDirectory", path });
   return withNewFd(
     v.symbols.open(
       v.ffi.ptr(bytes),
@@ -262,7 +298,10 @@ export function openDirectory(path: string): TDirectoryHandle {
     ),
     (fd) => {
       checkCloexec(fd);
-      return { fd, generation: directoryGeneration(fd), closed: false };
+      const generation = directoryGeneration(fd);
+      fdPaths.set(fd, path);
+      emit({ phase: "after", operation: "openDirectory", path, fd });
+      return { fd, generation, closed: false };
     },
   );
 }
@@ -276,15 +315,29 @@ export function openChild(
   ensureOpen(dir);
   const v = n();
   const bytes = basename(name);
+  const path = childPath(dir, name);
+  emit({ phase: "before", operation: "openChild", path, name, dirFd: dir.fd });
   return withNewFd(
     v.symbols.openat(
       dir.fd,
       v.ffi.ptr(bytes),
-      flags | v.abi.flags.O_NOFOLLOW | v.abi.flags.O_CLOEXEC,
+      flags |
+        v.abi.flags.O_NONBLOCK |
+        v.abi.flags.O_NOFOLLOW |
+        v.abi.flags.O_CLOEXEC,
       mode,
     ),
     (fd) => {
       checkCloexec(fd);
+      if (path !== undefined) fdPaths.set(fd, path);
+      emit({
+        phase: "after",
+        operation: "openChild",
+        path,
+        name,
+        dirFd: dir.fd,
+        fd,
+      });
       return { fd, closed: false };
     },
   );
@@ -298,6 +351,14 @@ export function openDirectoryChild(
   const v = n();
   const bytes = basename(name);
   const f = v.abi.flags;
+  const path = childPath(dir, name);
+  emit({
+    phase: "before",
+    operation: "openDirectoryChild",
+    path,
+    name,
+    dirFd: dir.fd,
+  });
   return withNewFd(
     v.symbols.openat(
       dir.fd,
@@ -307,7 +368,17 @@ export function openDirectoryChild(
     ),
     (fd) => {
       checkCloexec(fd);
-      return { fd, generation: directoryGeneration(fd), closed: false };
+      const generation = directoryGeneration(fd);
+      if (path !== undefined) fdPaths.set(fd, path);
+      emit({
+        phase: "after",
+        operation: "openDirectoryChild",
+        path,
+        name,
+        dirFd: dir.fd,
+        fd,
+      });
+      return { fd, generation, closed: false };
     },
   );
 }
@@ -316,8 +387,11 @@ export function mkdirChild(dir: TDirectoryHandle, name: string): void {
   ensureOpen(dir);
   const v = n();
   const bytes = basename(name);
+  const path = childPath(dir, name);
+  emit({ phase: "before", operation: "mkdirChild", path, name, dirFd: dir.fd });
   if (v.symbols.mkdirat(dir.fd, v.ffi.ptr(bytes), 0o700) < 0)
     throw nativeError("mkdirat");
+  emit({ phase: "after", operation: "mkdirChild", path, name, dirFd: dir.fd });
 }
 
 export function linkChild(
@@ -331,6 +405,14 @@ export function linkChild(
   const v = n();
   const sourceBytes = basename(source);
   const targetBytes = basename(targetName);
+  const path = childPath(targetDir, targetName);
+  emit({
+    phase: "before",
+    operation: "linkChild",
+    path,
+    name: targetName,
+    dirFd: targetDir.fd,
+  });
   if (
     v.symbols.linkat(
       sourceDir.fd,
@@ -341,25 +423,56 @@ export function linkChild(
     ) < 0
   )
     throw nativeError("linkat");
+  emit({
+    phase: "after",
+    operation: "linkChild",
+    path,
+    name: targetName,
+    dirFd: targetDir.fd,
+  });
 }
 
 export function unlinkChild(dir: TDirectoryHandle, name: string): void {
   ensureOpen(dir);
   const v = n();
   const bytes = basename(name);
+  const path = childPath(dir, name);
+  emit({
+    phase: "before",
+    operation: "unlinkChild",
+    path,
+    name,
+    dirFd: dir.fd,
+  });
   if (v.symbols.unlinkat(dir.fd, v.ffi.ptr(bytes), 0) < 0)
     throw nativeError("unlinkat");
+  emit({ phase: "after", operation: "unlinkChild", path, name, dirFd: dir.fd });
 }
 
 export function removeEmptyChild(parent: TDirectoryHandle, name: string): void {
   ensureOpen(parent);
   const v = n();
   const bytes = basename(name);
+  const path = childPath(parent, name);
+  emit({
+    phase: "before",
+    operation: "removeEmptyChild",
+    path,
+    name,
+    dirFd: parent.fd,
+  });
   if (
     v.symbols.unlinkat(parent.fd, v.ffi.ptr(bytes), v.abi.flags.AT_REMOVEDIR) <
     0
   )
     throw nativeError("unlinkat(AT_REMOVEDIR)");
+  emit({
+    phase: "after",
+    operation: "removeEmptyChild",
+    path,
+    name,
+    dirFd: parent.fd,
+  });
 }
 
 export function listDirectory(
@@ -367,10 +480,12 @@ export function listDirectory(
   maxEntries = 4096,
 ): string[] {
   ensureOpen(dir);
-  if (!Number.isSafeInteger(maxEntries) || maxEntries < 1)
+  if (!Number.isSafeInteger(maxEntries) || maxEntries < 0)
     throw new RangeError("dir-lock-fs: invalid listing limit");
   const v = n();
   const f = v.abi.flags;
+  const path = fdPaths.get(dir.fd);
+  emit({ phase: "before", operation: "listDirectory", path, dirFd: dir.fd });
   const dot = cString(".");
   const fd = v.symbols.openat(
     dir.fd,
@@ -379,6 +494,7 @@ export function listDirectory(
     0,
   );
   if (fd < 0) throw nativeError("openat(.)");
+  if (path !== undefined) fdPaths.set(fd, path);
   let ownedByStream = false;
   try {
     checkCloexec(fd);
@@ -441,17 +557,27 @@ export function listDirectory(
       firstError = error;
     }
     const closed = v.symbols.closedir(stream as ReturnType<typeof v.ffi.ptr>);
+    fdPaths.delete(fd);
     const closeError = closed < 0 ? nativeError("closedir") : undefined;
     if (firstError) throw firstError;
     if (closeError) throw closeError;
+    emit({
+      phase: "after",
+      operation: "listDirectory",
+      path,
+      dirFd: dir.fd,
+      fd,
+    });
     return names;
   } catch (error) {
-    if (!ownedByStream)
+    if (!ownedByStream) {
+      fdPaths.delete(fd);
       try {
         closeSync(fd);
       } catch {
         /* Preserve first error. */
       }
+    }
     throw error;
   }
 }
@@ -472,5 +598,6 @@ export function unlockGate(handle: TFileHandle): void {
 export function close(handle: TNativeHandle): void {
   if (handle.closed) return;
   handle.closed = true;
+  fdPaths.delete(handle.fd);
   closeSync(handle.fd);
 }
