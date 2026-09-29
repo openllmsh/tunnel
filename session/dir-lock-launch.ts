@@ -1,4 +1,4 @@
-import { closeSync, fsyncSync, openSync, writeFileSync } from "node:fs";
+import { fsyncSync, writeFileSync } from "node:fs";
 import { isAbsolute } from "node:path";
 import type { TDirLockOwner } from "./dir-lock";
 import type { TLockControl } from "./dir-lock-control";
@@ -41,6 +41,7 @@ import {
   unlinkChild,
 } from "./dir-lock-fs";
 import { inspectLegacyHold } from "./dir-lock-legacy";
+import { writeLockReply } from "./dir-lock-reply";
 import { processIdentityStatus, processStartIdentity } from "./local-runtime";
 
 export type TLaunchMode = "mixed" | "new-only";
@@ -447,27 +448,7 @@ function publication(ctx: TLockControl): {
 }
 
 function writeReady(path: string, code: number, nonce?: string): void {
-  if (!isAbsolute(path) || path.includes("\0"))
-    throw new TypeError("invalid launch readiness path");
-  const flags = posixOpenFlags();
-  const fd = openSync(
-    path,
-    flags.O_WRONLY |
-      flags.O_CREAT |
-      flags.O_EXCL |
-      flags.O_NOFOLLOW |
-      flags.O_CLOEXEC,
-    0o600,
-  );
-  try {
-    writeFileSync(
-      fd,
-      `${JSON.stringify({ version: 3, code, nonce: nonce ?? null })}\n`,
-    );
-    fsyncSync(fd);
-  } finally {
-    closeSync(fd);
-  }
+  writeLockReply(path, code, nonce ?? null);
 }
 
 export async function runLaunchPublisher(

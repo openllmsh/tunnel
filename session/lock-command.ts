@@ -1,11 +1,4 @@
-import {
-  closeSync,
-  constants,
-  lstatSync,
-  openSync,
-  readFileSync,
-  writeFileSync,
-} from "node:fs";
+import { lstatSync, readFileSync } from "node:fs";
 import { isAbsolute } from "node:path";
 import type { TDirLockCodec } from "./dir-lock";
 import { acquireDirLockSync } from "./dir-lock";
@@ -15,6 +8,7 @@ import {
   handoffLaunchChild,
   runLaunchPublisher,
 } from "./dir-lock-launch";
+import { writeLockReply as writeResponse } from "./dir-lock-reply";
 import { processIdentityStatus, processStartIdentity } from "./local-runtime";
 
 const helperCodec = (kind: string): TDirLockCodec => ({
@@ -32,21 +26,6 @@ const envLockMs = (name: string, fallback: number): number => {
   return Number.isSafeInteger(seconds) && seconds > 0 && seconds <= 3600
     ? seconds * 1000
     : fallback;
-};
-const writeResponse = (path: string, code: number): void => {
-  const fd = openSync(
-    path,
-    constants.O_WRONLY |
-      constants.O_CREAT |
-      constants.O_EXCL |
-      constants.O_NOFOLLOW,
-    0o600,
-  );
-  try {
-    writeFileSync(fd, `${JSON.stringify({ version: 3, code })}\n`);
-  } finally {
-    closeSync(fd);
-  }
 };
 export const runInternalLockControl = async (
   args: readonly string[],
