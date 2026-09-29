@@ -40,7 +40,7 @@ import {
   statDescriptor,
   unlinkChild,
 } from "./dir-lock-fs";
-import { collectEmptyControl, inspectLegacyHold } from "./dir-lock-legacy";
+import { inspectLegacyHold } from "./dir-lock-legacy";
 import { writeLockReply } from "./dir-lock-reply";
 import { processIdentityStatus, processStartIdentity } from "./local-runtime";
 
@@ -478,8 +478,6 @@ export async function runLaunchPublisher(
     try {
       const checked = withLockGate(vendor, () => {
         inspectLegacyHold(vendor);
-        // This inspection must not leave vendor control state behind.
-        collectEmptyControl(vendor);
         return true;
       });
       if (checked !== true)
@@ -512,8 +510,6 @@ export async function runLaunchPublisher(
           if (!evidence.names.includes("handoff.v3")) return false;
           validatePublication(ctx, evidence);
           cleanupPublication(ctx, evidence, true);
-          // The handoff is complete. Leave no launch control behind.
-          collectEmptyControl(ctx);
           return true;
         } finally {
           close(evidence.transaction);

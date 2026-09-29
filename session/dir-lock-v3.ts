@@ -12,8 +12,6 @@ import {
   childExists,
   closeLockControl,
   errorCode,
-  GATE_REOPEN_LIMIT,
-  GateVanishedError,
   LegacyLockError,
   LockUnknownError,
   lockGeneration,
@@ -50,11 +48,7 @@ import {
   statDescriptor,
   unlinkChild,
 } from "./dir-lock-fs";
-import {
-  collectEmptyControl,
-  inspectLegacyHold,
-  namespaceSuffix,
-} from "./dir-lock-legacy";
+import { inspectLegacyHold, namespaceSuffix } from "./dir-lock-legacy";
 import { removeEndedVendorGroups } from "./dir-lock-vendor";
 import { processIdentityStatus, processStartIdentity } from "./local-runtime";
 
@@ -753,9 +747,6 @@ const acquireAttempt = (
                 capturedTransaction,
                 capturedGeneration,
               );
-              // The last claim is gone. An empty control leaves the parent
-              // as it was before the first acquisition.
-              collectEmptyControl(ctx);
               return true;
             });
             if (released !== null) break;
@@ -816,9 +807,6 @@ const acquireAttempt = (
           if (removeEmptyGeneration(ctx.parent, ctx.base, generation))
             collectClaim(ctx, claim);
         } else if (!dir) collectClaim(ctx, claim);
-        // A cancelled last claim also leaves no control behind. The next
-        // attempt opens the control again when this call collected it.
-        collectEmptyControl(ctx);
       } catch {
         /* Keep the reservation and transaction for recovery. */
       }
@@ -829,38 +817,6 @@ const acquireAttempt = (
       if (!granted && dir) close(dir);
     }
   });
-/**
- * Open the control for an acquisition. When the parent directory is gone
- * because a previous holder's caller removed its empty state root, give the
- * caller its `before-mkdir` step once so it can create the parent again, then
- * open once more.
- */
-const openControlForAcquire = (
-  path: string,
-  kind: TLockKind,
-  opts: TDirLockOptions,
-): TLockControl => {
-  try {
-    return openLockControl(path, kind);
-  } catch (error) {
-    if (errorCode(error) !== "ENOENT" || !opts.onStep) throw error;
-    opts.onStep("before-mkdir", path);
-    return openLockControl(path, kind);
-  }
-};
-/**
- * Replace a control whose gate another process collected. Bounded: each
- * collection is one complete cycle of another process.
- */
-const reopenControl = (
-  ctx: TLockControl,
-  reopens: number,
-  opts: TDirLockOptions,
-): TLockControl | null => {
-  closeLockControl(ctx);
-  if (reopens > GATE_REOPEN_LIMIT) return null;
-  return openControlForAcquire(ctx.path, ctx.kind, opts);
-};
 export const acquireDirLockV3Sync = (
   path: string,
   codec: TDirLockCodec,
@@ -869,28 +825,17 @@ export const acquireDirLockV3Sync = (
   const clock = clockFor(opts);
   pendingReleases.get(path)?.();
   if (pendingReleases.size >= 64) return null;
-  let ctx: TLockControl | null = openControlForAcquire(
-    path,
-    lockKindForCodec(codec),
-    opts,
-  );
+  const ctx = openLockControl(path, lockKindForCodec(codec));
   let release: TDirLockRelease | null = null;
   const poll = Math.max(1, opts.pollMs ?? 10);
   const attempts = 1 + Math.ceil(Math.max(0, opts.waitMs) / poll);
   const wait = new Int32Array(new SharedArrayBuffer(4));
   let publishError: unknown;
-  let reopens = 0;
   try {
     for (let index = 0; index < attempts; index++) {
       try {
         release = acquireAttempt(ctx, opts, clock);
       } catch (error) {
-        if (error instanceof GateVanishedError) {
-          ctx = reopenControl(ctx, ++reopens, opts);
-          if (ctx === null) return null;
-          index--;
-          continue;
-        }
         if (!["EIO", "ENOSPC"].includes(errorCode(error) ?? "")) throw error;
         publishError ??= error;
       }
@@ -903,7 +848,7 @@ export const acquireDirLockV3Sync = (
     if (publishError !== undefined) throw publishError;
     return null;
   } finally {
-    if (!release && ctx !== null) closeLockControl(ctx);
+    if (!release) closeLockControl(ctx);
   }
 };
 export const acquireDirLockV3 = async (
@@ -914,27 +859,16 @@ export const acquireDirLockV3 = async (
   const clock = clockFor(opts);
   pendingReleases.get(path)?.();
   if (pendingReleases.size >= 64) return null;
-  let ctx: TLockControl | null = openControlForAcquire(
-    path,
-    lockKindForCodec(codec),
-    opts,
-  );
+  const ctx = openLockControl(path, lockKindForCodec(codec));
   let release: TDirLockRelease | null = null;
   const poll = Math.max(1, opts.pollMs ?? 50);
   const attempts = 1 + Math.ceil(Math.max(0, opts.waitMs) / poll);
   let publishError: unknown;
-  let reopens = 0;
   try {
     for (let index = 0; index < attempts; index++) {
       try {
         release = acquireAttempt(ctx, opts, clock);
       } catch (error) {
-        if (error instanceof GateVanishedError) {
-          ctx = reopenControl(ctx, ++reopens, opts);
-          if (ctx === null) return null;
-          index--;
-          continue;
-        }
         if (!["EIO", "ENOSPC"].includes(errorCode(error) ?? "")) throw error;
         publishError ??= error;
       }
@@ -951,7 +885,7 @@ export const acquireDirLockV3 = async (
     if (publishError !== undefined) throw publishError;
     return null;
   } finally {
-    if (!release && ctx !== null) closeLockControl(ctx);
+    if (!release) closeLockControl(ctx);
   }
 };
 export const inspectDirLockV3 = (
@@ -965,11 +899,7 @@ export const inspectDirLockV3 = (
     withLockGate(ctx, () => {
       inspectLegacyHold(ctx);
       recoverControl(ctx, opts, clock.deadline);
-      collectEmptyControl(ctx);
     });
-  } catch (error) {
-    // Another process collected the control: there is nothing to inspect.
-    if (!(error instanceof GateVanishedError)) throw error;
   } finally {
     closeLockControl(ctx);
   }

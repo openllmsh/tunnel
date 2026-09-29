@@ -50,16 +50,6 @@ export class LegacyLockError extends Error {
 export class LockUnknownError extends Error {
   readonly code = "LOCK_UNKNOWN";
 }
-/**
- * The open metadata gate is no longer the named gate file. Another process
- * collected the empty control directory after its last claim ended. The
- * caller must open the control again before its next operation.
- */
-export class GateVanishedError extends Error {
-  readonly code = "LOCK_GATE_VANISHED";
-}
-/** Bounded reopen attempts when a control directory is collected under us. */
-export const GATE_REOPEN_LIMIT = 8;
 export type TLockKind = TDirLockKind;
 export type TLockControl = {
   readonly path: string;
@@ -270,6 +260,8 @@ export const openLockControl = (
   )
     throw new LockUnknownError("unsupported lock path");
   const parent = openPinnedPath(dirname(path));
+  let control: TDirectoryHandle | undefined;
+  let gate: TFileHandle | undefined;
   try {
     const parentStat = statDescriptor(parent.fd);
     if (
@@ -277,34 +269,6 @@ export const openLockControl = (
       (parentStat.mode & 0o022n) !== 0n
     )
       throw new LockUnknownError("lock parent is writable by another user");
-    // A concurrent final release can collect the empty control directory
-    // between our steps. Each such collection is one completed cycle of
-    // another process, so a small fixed number of reopen attempts is enough.
-    for (let attempt = 1; ; attempt++) {
-      try {
-        return openControlOnce(path, base, kind, parent);
-      } catch (error) {
-        if (
-          !(error instanceof GateVanishedError) ||
-          attempt >= GATE_REOPEN_LIMIT
-        )
-          throw error;
-      }
-    }
-  } catch (error) {
-    close(parent);
-    throw error;
-  }
-};
-const openControlOnce = (
-  path: string,
-  base: string,
-  kind: TLockKind,
-  parent: TDirectoryHandle,
-): TLockControl => {
-  let control: TDirectoryHandle | undefined;
-  let gate: TFileHandle | undefined;
-  try {
     control = ensureDirectory(parent, formatDirLockControlName(base));
     try {
       gate = openChild(
@@ -316,20 +280,10 @@ const openControlOnce = (
         0o600,
       );
     } catch (error) {
-      if (errorCode(error) === "ENOENT")
-        throw new GateVanishedError("control directory was collected");
       if (errorCode(error) !== "EEXIST") throw error;
-      try {
-        gate = openChild(control, "meta.v3.lock", posixOpenFlags().O_RDWR, 0);
-      } catch (inner) {
-        if (errorCode(inner) === "ENOENT")
-          throw new GateVanishedError("metadata gate was collected");
-        throw inner;
-      }
+      gate = openChild(control, "meta.v3.lock", posixOpenFlags().O_RDWR, 0);
     }
     const stat = statDescriptor(gate.fd);
-    if (stat.nlink === 0n)
-      throw new GateVanishedError("metadata gate was collected");
     if (
       !stat.isFile() ||
       stat.uid !== BigInt(process.getuid?.() ?? -1) ||
@@ -341,11 +295,7 @@ const openControlOnce = (
   } catch (error) {
     if (gate !== undefined) close(gate);
     if (control !== undefined) close(control);
-    if (
-      error instanceof GateVanishedError ||
-      (errorCode(error) === "ENOENT" && control === undefined)
-    )
-      throw new GateVanishedError("control directory was collected");
+    close(parent);
     throw error;
   }
 };
@@ -366,24 +316,17 @@ export const withLockGate = <TResult>(
 ): TResult | null => {
   if (!tryLockGate(ctx.gate)) return null;
   try {
-    let gate: TFileHandle;
-    try {
-      gate = openChild(
-        ctx.control,
-        "meta.v3.lock",
-        posixOpenFlags().O_RDONLY,
-        0,
-      );
-    } catch (error) {
-      if (errorCode(error) === "ENOENT")
-        throw new GateVanishedError("metadata gate was collected");
-      throw error;
-    }
+    const gate = openChild(
+      ctx.control,
+      "meta.v3.lock",
+      posixOpenFlags().O_RDONLY,
+      0,
+    );
     try {
       const held = statDescriptor(ctx.gate.fd);
       const named = statDescriptor(gate.fd);
       if (held.dev !== named.dev || held.ino !== named.ino)
-        throw new GateVanishedError("metadata gate changed");
+        throw new LockUnknownError("metadata gate changed");
     } finally {
       close(gate);
     }
