@@ -192,11 +192,11 @@ export const collectEmptyControl = (ctx: TLockControl): boolean => {
   unlinkChild(ctx.control, "meta.v3.lock");
   try {
     removeEmptyChild(ctx.parent, formatDirLockControlName(ctx.base));
-  } catch (error) {
-    const code = errorCode(error);
-    if (code === "ENOTEMPTY" || code === "EEXIST" || code === "ENOENT")
-      return false;
-    throw error;
+  } catch {
+    // A concurrent opener created a fresh gate (ENOTEMPTY), or the removal
+    // failed. A control without a gate is safe: the next opener creates a
+    // new gate with exclusive creation. The completed release stands.
+    return false;
   }
   return true;
 };
