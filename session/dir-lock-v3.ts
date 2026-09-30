@@ -13,6 +13,7 @@ import {
   closeLockControl,
   errorCode,
   LegacyLockError,
+  LockGateChangedError,
   LockUnknownError,
   lockGeneration,
   lockNonce,
@@ -549,10 +550,87 @@ const clockFor = (opts: TDirLockOptions): TAttemptClock => {
     deadline: startElapsed + Math.max(0, opts.waitMs),
   };
 };
+type TGrantedClaim = {
+  readonly active: string;
+  readonly dir: TDirectoryHandle;
+  readonly claim: TDirLockClaim;
+  readonly transaction: string;
+  readonly generation: string;
+};
+/**
+ * Roll back a claim whose release never reached the caller. The owner is
+ * published and bound to this process, so no other actor can release it.
+ * Mark the claim terminal and clean its records under the gate. When the
+ * current descriptors are unusable, reopen the control once. A failure keeps
+ * the records for recovery.
+ */
+const rollbackGrantedClaim = (
+  ctx: TLockControl,
+  granted: TGrantedClaim,
+): void => {
+  activeClaims.delete(granted.active);
+  const sweep = (control: TLockControl): boolean =>
+    withLockGate(control, () => {
+      terminalize(control, granted.claim, false);
+      cleanupClaim(
+        control,
+        granted.dir,
+        granted.claim,
+        granted.transaction,
+        granted.generation,
+      );
+      return true;
+    }) === true;
+  let done = false;
+  try {
+    done = sweep(ctx);
+  } catch {
+    /* The gate descriptor can be unusable after a failed unlock. */
+  }
+  if (!done) {
+    let fresh: TLockControl | undefined;
+    try {
+      fresh = openLockControl(ctx.path, ctx.kind);
+      sweep(fresh);
+    } catch {
+      /* Keep the claim records for recovery. */
+    } finally {
+      if (fresh !== undefined) closeLockControl(fresh);
+    }
+  }
+  try {
+    close(granted.dir);
+  } catch {
+    /* The descriptor is already released. */
+  }
+};
 const acquireAttempt = (
   ctx: TLockControl,
   opts: TDirLockOptions,
   clock: TAttemptClock,
+): TDirLockRelease | null => {
+  // The gated body records the grant here. Register the claim only after the
+  // gate unlock returns. When the unlock throws, the release closure is lost
+  // while the owner stays published: roll the grant back so this process does
+  // not hold a claim it can never release.
+  const published: { current?: TGrantedClaim } = {};
+  let result: TDirLockRelease | null;
+  try {
+    result = acquireAttemptGated(ctx, opts, clock, published);
+  } catch (error) {
+    if (published.current !== undefined)
+      rollbackGrantedClaim(ctx, published.current);
+    throw error;
+  }
+  if (published.current !== undefined)
+    activeClaims.add(published.current.active);
+  return result;
+};
+const acquireAttemptGated = (
+  ctx: TLockControl,
+  opts: TDirLockOptions,
+  clock: TAttemptClock,
+  published: { current?: TGrantedClaim },
 ): TDirLockRelease | null =>
   withLockGate(ctx, () => {
     retryCancellations(ctx);
@@ -755,7 +833,13 @@ const acquireAttempt = (
       opts.onStep?.("before-grant", ctx.path, claim);
       granted = true;
       const activeClaim = encodeDirLockActor(claim);
-      activeClaims.add(activeClaim);
+      published.current = {
+        active: activeClaim,
+        dir,
+        claim,
+        transaction,
+        generation,
+      };
       const capturedDir = dir;
       const capturedTransaction = transaction;
       const capturedGeneration = generation;
@@ -891,9 +975,10 @@ const openControlForAcquire = (
   }
 };
 /**
- * The control vanished during this attempt. Close it and open it again.
- * The caller counts this as one normal attempt. The wait deadline stops
- * the retries. There is no separate reopen limit.
+ * The control vanished during this attempt, or an explicit removal replaced
+ * its gate inode. Close it and open it again. The caller counts this as one
+ * normal attempt. The wait deadline stops the retries. There is no separate
+ * reopen limit.
  */
 const reopenVanishedControl = (
   ctx: TLockControl,
@@ -924,7 +1009,10 @@ export const acquireDirLockV3Sync = (
       try {
         release = acquireAttempt(ctx, opts, clock);
       } catch (error) {
-        if (errorCode(error) === "ENOENT") {
+        if (
+          errorCode(error) === "ENOENT" ||
+          error instanceof LockGateChangedError
+        ) {
           ctx = reopenVanishedControl(ctx, opts);
         } else if (errorCode(error) === "EINTR") {
           // A signal interrupted the attempt. It is transient. The attempt
@@ -966,7 +1054,10 @@ export const acquireDirLockV3 = async (
       try {
         release = acquireAttempt(ctx, opts, clock);
       } catch (error) {
-        if (errorCode(error) === "ENOENT") {
+        if (
+          errorCode(error) === "ENOENT" ||
+          error instanceof LockGateChangedError
+        ) {
           ctx = reopenVanishedControl(ctx, opts);
         } else if (errorCode(error) === "EINTR") {
           // A signal interrupted the attempt. It is transient. The attempt
