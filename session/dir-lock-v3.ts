@@ -370,8 +370,11 @@ const recoverControl = (
   const now = opts.elapsedNow ?? opts.now ?? performance.now.bind(performance);
   let work = 0;
   const names = checkedNames(ctx.control, 512);
+  // Adjudicate a bounded minimum of records before the deadline may stop the
+  // sweep. Otherwise a slow prelude turns deterministic rejections into a
+  // quiet "busy" result.
   for (const name of names) {
-    if (++work > 32 || now() > deadline) return;
+    if (++work > 32 || (work > 8 && now() > deadline)) return;
     const tx = parseDirLockTransactionName(name);
     if (tx === null) continue;
     const claim: TDirLockClaim = { kind: tx.kind, ...tx.actor };
@@ -470,7 +473,7 @@ const recoverControl = (
     }
   }
   for (const name of checkedNames(ctx.control, 512)) {
-    if (++work > 32 || now() > deadline) return;
+    if (++work > 32 || (work > 8 && now() > deadline)) return;
     const match = /^[bcx]\.v3\.([eurva])\.(.+)$/.exec(name);
     if (!match) continue;
     const actor = decodeDirLockActor(match[2] ?? "");
@@ -923,6 +926,9 @@ export const acquireDirLockV3Sync = (
       } catch (error) {
         if (errorCode(error) === "ENOENT") {
           ctx = reopenVanishedControl(ctx, opts);
+        } else if (errorCode(error) === "EINTR") {
+          // A signal interrupted the attempt. It is transient. The attempt
+          // loop and the deadline bound the retry.
         } else if (!["EIO", "ENOSPC"].includes(errorCode(error) ?? "")) {
           throw error;
         } else {
@@ -962,6 +968,9 @@ export const acquireDirLockV3 = async (
       } catch (error) {
         if (errorCode(error) === "ENOENT") {
           ctx = reopenVanishedControl(ctx, opts);
+        } else if (errorCode(error) === "EINTR") {
+          // A signal interrupted the attempt. It is transient. The attempt
+          // loop and the deadline bound the retry.
         } else if (!["EIO", "ENOSPC"].includes(errorCode(error) ?? "")) {
           throw error;
         } else {

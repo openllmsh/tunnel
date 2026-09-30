@@ -394,24 +394,7 @@ export const removeIdleLockControls = (parentPath: string): boolean => {
     if (names.some((name) => parseDirLockControlName(name) === null))
       return false;
     for (const name of names) {
-      if (!idleGateOnly(parent, name)) return false;
-    }
-    for (const name of names) {
-      const dir = childDirectory(parent, name);
-      try {
-        const children = checkedNames(dir, 8);
-        if (children.length !== 1 || children[0] !== "meta.v3.lock")
-          return false;
-        unlinkChild(dir, "meta.v3.lock");
-      } finally {
-        close(dir);
-      }
-      try {
-        removeEmptyChild(parent, name);
-      } catch {
-        // A crash or a failed rmdir can leave a control with no gate.
-        return false;
-      }
+      if (!removeIdleControl(parent, name)) return false;
     }
     try {
       return checkedNames(parent, 4096).length === 0;
@@ -423,33 +406,66 @@ export const removeIdleLockControls = (parentPath: string): boolean => {
   }
 };
 
-/** True when this control directory holds only a private gate file. */
-const idleGateOnly = (parent: TDirectoryHandle, name: string): boolean => {
-  let dir: TDirectoryHandle;
+/**
+ * Remove one control directory that holds only a private gate file. The gate
+ * flock is taken before the gate is unlinked. A live protocol user that
+ * already holds the gate keeps its control directory.
+ */
+const removeIdleControl = (parent: TDirectoryHandle, name: string): boolean => {
+  let dir: TDirectoryHandle | undefined;
+  let gate: TFileHandle | undefined;
   try {
     dir = childDirectory(parent, name);
-  } catch {
-    return false;
-  }
-  try {
     const children = checkedNames(dir, 8);
     if (children.length !== 1 || children[0] !== "meta.v3.lock") return false;
-    const gate = openChild(dir, "meta.v3.lock", posixOpenFlags().O_RDONLY, 0);
-    try {
-      const stat = statDescriptor(gate.fd);
-      const uid = BigInt(process.getuid?.() ?? -1);
-      return (
-        stat.isFile() &&
-        stat.nlink === 1n &&
-        stat.uid === uid &&
-        (stat.mode & 0o077n) === 0n
-      );
-    } finally {
-      close(gate);
-    }
+    gate = openChild(dir, "meta.v3.lock", posixOpenFlags().O_RDWR, 0);
+    const stat = statDescriptor(gate.fd);
+    const uid = BigInt(process.getuid?.() ?? -1);
+    if (
+      !stat.isFile() ||
+      stat.nlink !== 1n ||
+      stat.uid !== uid ||
+      (stat.mode & 0o077n) !== 0n
+    )
+      return false;
+    if (!tryLockGate(gate)) return false;
+    unlinkChild(dir, "meta.v3.lock");
   } catch {
     return false;
   } finally {
-    close(dir);
+    if (gate !== undefined) close(gate);
+    if (dir !== undefined) close(dir);
+  }
+  try {
+    removeEmptyChild(parent, name);
+  } catch {
+    // A failed rmdir keeps the control directory. Restore the gate so the
+    // control keeps its permanent protocol shape.
+    restoreIdleGate(parent, name);
+    return false;
+  }
+  return true;
+};
+
+/** Recreate the private gate when a failed rmdir kept its control directory. */
+const restoreIdleGate = (parent: TDirectoryHandle, name: string): void => {
+  let dir: TDirectoryHandle | undefined;
+  try {
+    dir = childDirectory(parent, name);
+    if (checkedNames(dir, 8).length !== 0) return;
+    close(
+      openChild(
+        dir,
+        "meta.v3.lock",
+        posixOpenFlags().O_RDWR |
+          posixOpenFlags().O_CREAT |
+          posixOpenFlags().O_EXCL,
+        0o600,
+      ),
+    );
+  } catch {
+    /* A second fault keeps the gate absent. The control stays either way. */
+  } finally {
+    if (dir !== undefined) close(dir);
   }
 };

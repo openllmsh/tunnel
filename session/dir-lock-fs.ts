@@ -20,7 +20,8 @@ export type TDirLockFsEvent = Readonly<{
     | "linkChild"
     | "unlinkChild"
     | "removeEmptyChild"
-    | "listDirectory";
+    | "listDirectory"
+    | "flockGate";
   path?: string;
   name?: string;
   dirFd?: number;
@@ -590,17 +591,45 @@ export function listDirectory(
   }
 }
 
+// A signal interrupt is transient. Retry it a bounded number of times. A
+// gate that stays interrupted reports busy so the caller retries inside its
+// own deadline.
+const gateInterruptRetries = 4;
+const interrupted = (error: unknown): boolean =>
+  (error as NodeJS.ErrnoException | undefined)?.code === "EINTR";
+
 export function tryLockGate(handle: TFileHandle): boolean {
   ensureOpen(handle);
-  if (n().symbols.flock(handle.fd, 2 | 4) === 0) return true; // LOCK_EX | LOCK_NB
-  const error = nativeError("flock(LOCK_EX|LOCK_NB)");
-  if (error.code === "EAGAIN") return false;
-  throw error;
+  const v = n();
+  for (let attempt = 0; ; attempt++) {
+    let locked = false;
+    try {
+      emit({ phase: "before", operation: "flockGate", fd: handle.fd });
+      locked = v.symbols.flock(handle.fd, 2 | 4) === 0; // LOCK_EX | LOCK_NB
+    } catch (error) {
+      if (!interrupted(error)) throw error;
+      if (attempt < gateInterruptRetries - 1) continue;
+      return false;
+    }
+    if (locked) return true;
+    const error = nativeError("flock(LOCK_EX|LOCK_NB)");
+    if (error.code === "EAGAIN") return false;
+    if (error.code === "EINTR") {
+      if (attempt < gateInterruptRetries - 1) continue;
+      return false;
+    }
+    throw error;
+  }
 }
 
 export function unlockGate(handle: TFileHandle): void {
   ensureOpen(handle);
-  if (n().symbols.flock(handle.fd, 8) < 0) throw nativeError("flock(LOCK_UN)");
+  for (let attempt = 0; ; attempt++) {
+    if (n().symbols.flock(handle.fd, 8) >= 0) return; // LOCK_UN
+    const error = nativeError("flock(LOCK_UN)");
+    if (error.code !== "EINTR" || attempt === gateInterruptRetries - 1)
+      throw error;
+  }
 }
 
 export function close(handle: TNativeHandle): void {
