@@ -51,6 +51,17 @@ export class LegacyLockError extends Error {
 export class LockUnknownError extends Error {
   readonly code = "LOCK_UNKNOWN";
 }
+/**
+ * The descriptor that holds the gate lock is not the gate file that the
+ * control directory names. The gate was unlinked and recreated by an
+ * explicit control removal. The caller can reopen the control and retry.
+ */
+export class LockGateChangedError extends LockUnknownError {
+  constructor() {
+    super("metadata gate changed");
+    this.name = "LockGateChangedError";
+  }
+}
 export type TLockKind = TDirLockKind;
 export type TLockControl = {
   readonly path: string;
@@ -327,7 +338,7 @@ export const withLockGate = <TResult>(
       const held = statDescriptor(ctx.gate.fd);
       const named = statDescriptor(gate.fd);
       if (held.dev !== named.dev || held.ino !== named.ino)
-        throw new LockUnknownError("metadata gate changed");
+        throw new LockGateChangedError();
     } finally {
       close(gate);
     }
@@ -408,12 +419,16 @@ export const removeIdleLockControls = (parentPath: string): boolean => {
 
 /**
  * Remove one control directory that holds only a private gate file. The gate
- * flock is taken before the gate is unlinked. A live protocol user that
- * already holds the gate keeps its control directory.
+ * flock is held from the unlink through the rmdir. A waiter that opened the
+ * gate earlier flocks an unlinked inode and fails its gate revalidation.
+ * A live protocol user that already holds the gate keeps its control
+ * directory.
  */
 const removeIdleControl = (parent: TDirectoryHandle, name: string): boolean => {
   let dir: TDirectoryHandle | undefined;
   let gate: TFileHandle | undefined;
+  let gateMissing = false;
+  let removed = false;
   try {
     dir = childDirectory(parent, name);
     const children = checkedNames(dir, 8);
@@ -430,29 +445,37 @@ const removeIdleControl = (parent: TDirectoryHandle, name: string): boolean => {
       return false;
     if (!tryLockGate(gate)) return false;
     unlinkChild(dir, "meta.v3.lock");
+    gateMissing = true;
+    try {
+      removeEmptyChild(parent, name);
+      removed = true;
+    } catch {
+      /* The directory stays. Restore its gate below. */
+    }
   } catch {
     return false;
   } finally {
     if (gate !== undefined) close(gate);
     if (dir !== undefined) close(dir);
   }
-  try {
-    removeEmptyChild(parent, name);
-  } catch {
+  if (gateMissing && !removed) {
     // A failed rmdir keeps the control directory. Restore the gate so the
     // control keeps its permanent protocol shape.
     restoreIdleGate(parent, name);
     return false;
   }
-  return true;
+  return removed;
 };
 
-/** Recreate the private gate when a failed rmdir kept its control directory. */
+/**
+ * Recreate the private gate when a failed rmdir kept its control directory.
+ * The gate must exist while the control exists. Other children do not stop
+ * the restore. An existing gate means a concurrent open already restored it.
+ */
 const restoreIdleGate = (parent: TDirectoryHandle, name: string): void => {
   let dir: TDirectoryHandle | undefined;
   try {
     dir = childDirectory(parent, name);
-    if (checkedNames(dir, 8).length !== 0) return;
     close(
       openChild(
         dir,
@@ -464,7 +487,8 @@ const restoreIdleGate = (parent: TDirectoryHandle, name: string): void => {
       ),
     );
   } catch {
-    /* A second fault keeps the gate absent. The control stays either way. */
+    /* EEXIST means the gate is back. Another fault leaves the gate absent;
+       the next control open recreates it. */
   } finally {
     if (dir !== undefined) close(dir);
   }
