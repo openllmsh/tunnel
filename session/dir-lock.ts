@@ -1,9 +1,19 @@
+import type { TDirLockObservation } from "./dir-lock-v3";
 /**
  * Node-only directory lock core.
  *
  * A codec owns the record format. The core owns all generation, ownership,
  * quarantine, release, and wait rules. Keep this file out of tunnel/index.ts.
  */
+import {
+  acquireDirLockV3,
+  acquireDirLockV3Sync,
+  inspectDirLockV3,
+  v3DirLockCodec,
+} from "./dir-lock-v3";
+
+export { LegacyLockError } from "./dir-lock-control";
+
 import { randomBytes } from "node:crypto";
 import {
   closeSync,
@@ -44,6 +54,7 @@ export type TDirLockCodec = {
   readonly kind: string;
   readonly ownerFile: string;
   readonly markerInsideDir?: boolean;
+  readonly observeOwner?: (dir: string) => TDirLockObservation;
   readonly readOwner: (dir: string) => TDirLockOwner | null;
   readonly serializeOwner: (owner: TDirLockOwner) => string;
   readonly parseOwner?: (value: string) => TDirLockOwner | null;
@@ -66,26 +77,30 @@ const parseEnvOwner = (value: string): TDirLockOwner | null => {
 };
 
 /** The installer-compatible codec for `<env>.lock.d`. */
-export const envDirLockCodec: TDirLockCodec = {
-  kind: ENV_LOCK_KIND,
-  ownerFile: "owner",
-  markerInsideDir: true,
-  readOwner: (dir: string): TDirLockOwner | null => {
-    try {
-      return parseEnvOwner(readFileSync(join(dir, "owner"), "utf8"));
-    } catch {
-      return null;
-    }
-  },
-  serializeOwner: (owner: TDirLockOwner): string =>
-    `kind=${ENV_LOCK_KIND} pid=${owner.pid} start=${owner.start} nonce=${owner.nonce}\n`,
-};
+export const envDirLockCodec: TDirLockCodec =
+  process.platform !== "win32"
+    ? v3DirLockCodec("e")
+    : {
+        kind: ENV_LOCK_KIND,
+        ownerFile: "owner",
+        markerInsideDir: true,
+        readOwner: (dir: string): TDirLockOwner | null => {
+          try {
+            return parseEnvOwner(readFileSync(join(dir, "owner"), "utf8"));
+          } catch {
+            return null;
+          }
+        },
+        serializeOwner: (owner: TDirLockOwner): string =>
+          `kind=${ENV_LOCK_KIND} pid=${owner.pid} start=${owner.start} nonce=${owner.nonce}\n`,
+      };
 
 export type TDirLockStep =
   | "before-mkdir"
   | "after-mkdir"
   | "before-publish"
   | "after-publish"
+  | "before-grant"
   | "after-legacy-pin"
   | "before-legacy-rename"
   | "after-legacy-rename"
@@ -103,11 +118,18 @@ export type TDirLockStep =
   | "before-gc";
 
 export type TDirLockOptions = {
+  readonly worker?: {
+    readonly pid: number;
+    readonly start: string;
+    readonly nonce: string;
+  };
   readonly waitMs: number;
   readonly reclaimMs: number;
   readonly pollMs?: number;
   readonly synchronous?: boolean;
   readonly now?: () => number;
+  readonly elapsedNow?: () => number;
+  readonly wallNow?: () => number;
   readonly sleep?: (ms: number) => Promise<void>;
   readonly pidAlive?: (pid: number) => boolean;
   readonly startIdentity?: TProcessStartIdentityReader;
@@ -118,7 +140,11 @@ export type TDirLockOptions = {
   readonly isStale?: (path: string, asOfMtimeMs?: number) => boolean;
   readonly propagatePublishErrors?: boolean;
   readonly legacyHeld?: (deadline: number) => boolean;
-  readonly onStep?: (step: TDirLockStep, path: string) => void;
+  readonly onStep?: (
+    step: TDirLockStep,
+    path: string,
+    owner?: TDirLockOwner,
+  ) => void;
   readonly onRestore?: (from: string, to: string) => void;
 };
 
@@ -377,6 +403,10 @@ export const moveDirNoReplace = (
   onStep?: TDirLockOptions["onStep"],
   onRestore?: TDirLockOptions["onRestore"],
 ): boolean => {
+  if (process.platform !== "win32") {
+    inspectDirLockV3(to, codec, { waitMs: 0, reclaimMs: 0 });
+    return false;
+  }
   onRestore?.(from, to);
   onStep?.("before-restore-claim", to);
   // The public options callback carries both paths. The step callback is kept
@@ -393,6 +423,10 @@ export const publishDirLockOwner = (
   codec: TDirLockCodec,
   opts: TDirLockOptions,
 ): boolean => {
+  if (process.platform !== "win32") {
+    inspectDirLockV3(lockDir, codec, opts);
+    return false;
+  }
   opts.onStep?.("before-publish", lockDir);
   if (!sameIno(lockDir, expectedIno) || owner.start.length === 0) return false;
   if (markerExists(lockDir) || insideMarkerExists(lockDir, codec)) return false;
@@ -457,6 +491,10 @@ export const finishDirLockRelease = (
   codec: TDirLockCodec,
   opts: TDirLockOptions,
 ): boolean => {
+  if (process.platform !== "win32") {
+    inspectDirLockV3(lockDir, codec, opts);
+    return false;
+  }
   const parked = codec.readOwner(quarantine);
   // A failed read does not prove a foreign owner. Let GC retry the read.
   if (parked === null) return false;
@@ -482,6 +520,10 @@ export const releaseDirLock = (
   codec: TDirLockCodec,
   opts: TDirLockOptions,
 ): void => {
+  if (process.platform !== "win32") {
+    inspectDirLockV3(lockDir, codec, opts);
+    return;
+  }
   opts.onStep?.("before-release", lockDir);
   let current = codec.readOwner(lockDir);
   if (current?.pid !== owner.pid || current.nonce !== owner.nonce) {
@@ -600,15 +642,19 @@ const tryAcquireDirLockAttempt = (
     removeCreated(lockDir);
     return null;
   }
-  const owner: TDirLockOwner = {
-    kind: codec.kind,
-    pid: process.pid,
-    start:
-      (opts.ownerStartIdentity ?? opts.startIdentity ?? processStartIdentity)(
-        process.pid,
-      ) ?? "",
-    nonce: nonce(),
-  };
+  const owner: TDirLockOwner = opts.worker
+    ? { kind: codec.kind, ...opts.worker }
+    : {
+        kind: codec.kind,
+        pid: process.pid,
+        start:
+          (
+            opts.ownerStartIdentity ??
+            opts.startIdentity ??
+            processStartIdentity
+          )(process.pid) ?? "",
+        nonce: nonce(),
+      };
   if (owner.start.length === 0) {
     removeCreated(lockDir);
     return null;
@@ -665,6 +711,8 @@ export const tryAcquireDirLock = (
   codec: TDirLockCodec,
   opts: TDirLockOptions,
 ): TDirLockRelease | null => {
+  if (process.platform !== "win32")
+    return acquireDirLockV3Sync(lockDir, codec, { ...opts, waitMs: 0 });
   const state: TDirLockAttemptState = { unprovenInode: false };
   const first = tryAcquireDirLockAttempt(lockDir, codec, opts, state);
   if (first !== null || !state.unprovenInode) return first;
@@ -677,6 +725,10 @@ export const stealDirLock = (
   codec: TDirLockCodec,
   opts: TDirLockOptions,
 ): boolean => {
+  if (process.platform !== "win32") {
+    inspectDirLockV3(lockDir, codec, opts);
+    return !existsSync(lockDir);
+  }
   let originalStat: ReturnType<typeof statSync>;
   try {
     originalStat = statSync(lockDir);
@@ -807,6 +859,10 @@ export const sweepDirLockResidue = (
   codec: TDirLockCodec,
   opts: TDirLockOptions,
 ): void => {
+  if (process.platform !== "win32") {
+    inspectDirLockV3(lockDir, codec, opts);
+    return;
+  }
   opts.onStep?.("before-gc", lockDir);
   let names: string[];
   try {
@@ -975,6 +1031,8 @@ export const acquireDirLock = async (
   codec: TDirLockCodec,
   options: TDirLockOptions,
 ): Promise<TDirLockRelease | null> => {
+  if (process.platform !== "win32")
+    return acquireDirLockV3(lockDir, codec, options);
   const opts: TDirLockOptions = {
     ...options,
     now: options.now ?? defaultNow,
@@ -1019,6 +1077,8 @@ export const acquireDirLockSync = (
   codec: TDirLockCodec,
   options: TDirLockOptions,
 ): TDirLockRelease | null => {
+  if (process.platform !== "win32")
+    return acquireDirLockV3Sync(lockDir, codec, options);
   const opts: TDirLockOptions = { ...options, now: options.now ?? defaultNow };
   const now = opts.now ?? defaultNow;
   const deadline = now() + Math.max(0, opts.waitMs);

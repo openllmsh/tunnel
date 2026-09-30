@@ -11,6 +11,7 @@ import {
   type TDirLockRelease,
   tryAcquireDirLock,
 } from "./session/dir-lock";
+import { v3DirLockCodec } from "./session/dir-lock-v3";
 import type { TProcessStartIdentityReader } from "./session/local-runtime";
 import {
   legacyProcessStartIdentity,
@@ -26,6 +27,8 @@ export type TUpdateLockOptions = {
   readonly waitMs?: number;
   readonly reclaimMs?: number;
   readonly now?: () => number;
+  readonly elapsedNow?: () => number;
+  readonly wallNow?: () => number;
   readonly sleep?: (ms: number) => Promise<void>;
   readonly pidAlive?: (pid: number) => boolean;
   readonly startIdentity?: TProcessStartIdentityReader;
@@ -60,32 +63,38 @@ const ownerFromJson = (value: string): TDirLockOwner | null => {
   }
 };
 
-const updateCodec: TDirLockCodec = {
-  kind: UPDATE_KIND,
-  ownerFile: "owner.json",
-  readOwner: (dir: string): TDirLockOwner | null => {
-    try {
-      const published = ownerFromJson(
-        readFileSync(join(dir, "owner.json"), "utf8"),
-      );
-      if (published !== null) return published;
-    } catch {
-      // A publish may have stopped after the temp write.
-    }
-    try {
-      const temps = readdirSync(dir)
-        .filter(
-          (name) => name.startsWith("owner.json.") && name.endsWith(".tmp"),
-        )
-        .map((name) => ownerFromJson(readFileSync(join(dir, name), "utf8")))
-        .filter((owner): owner is TDirLockOwner => owner !== null);
-      return temps.length === 1 ? (temps[0] ?? null) : null;
-    } catch {
-      return null;
-    }
-  },
-  serializeOwner: (owner: TDirLockOwner): string => JSON.stringify(owner),
-};
+const updateCodec: TDirLockCodec =
+  process.platform !== "win32"
+    ? v3DirLockCodec("u")
+    : {
+        kind: UPDATE_KIND,
+        ownerFile: "owner.json",
+        readOwner: (dir: string): TDirLockOwner | null => {
+          try {
+            const published = ownerFromJson(
+              readFileSync(join(dir, "owner.json"), "utf8"),
+            );
+            if (published !== null) return published;
+          } catch {
+            // A publish may have stopped after the temp write.
+          }
+          try {
+            const temps = readdirSync(dir)
+              .filter(
+                (name) =>
+                  name.startsWith("owner.json.") && name.endsWith(".tmp"),
+              )
+              .map((name) =>
+                ownerFromJson(readFileSync(join(dir, name), "utf8")),
+              )
+              .filter((owner): owner is TDirLockOwner => owner !== null);
+            return temps.length === 1 ? (temps[0] ?? null) : null;
+          } catch {
+            return null;
+          }
+        },
+        serializeOwner: (owner: TDirLockOwner): string => JSON.stringify(owner),
+      };
 
 let stealGapHook: ((lockDir: string) => void) | null = null;
 let restoreGapHook: ((from: string, to: string) => void) | null = null;
@@ -106,7 +115,10 @@ const options = (value: TUpdateLockOptions = {}): TDirLockOptions => {
     waitMs: value.waitMs ?? UPDATE_LOCK_WAIT_MS,
     reclaimMs: value.reclaimMs ?? UPDATE_LOCK_RECLAIM_MS,
     pollMs: 250,
+    propagatePublishErrors: true,
     now: value.now,
+    elapsedNow: value.elapsedNow,
+    wallNow: value.wallNow,
     sleep: value.sleep,
     pidAlive: value.pidAlive,
     startIdentity: identity,

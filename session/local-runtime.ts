@@ -10,6 +10,7 @@ import {
   statSync,
   writeFileSync,
 } from "node:fs";
+import { observeDarwinProcess } from "./dir-lock-process";
 import {
   createWindowsSessionDirectory,
   createWindowsSessionFile,
@@ -147,6 +148,7 @@ const linuxProcStartTicks = (pid: number): number | null | undefined => {
     return procfsMounted() ? null : undefined;
   }
   const afterComm = stat.slice(stat.lastIndexOf(") ") + 2).split(" ");
+  if (afterComm[0] === "Z" || afterComm[0] === "X") return null;
   const ticks = Number(afterComm[19]);
   return Number.isSafeInteger(ticks) && ticks > 0 ? ticks : undefined;
 };
@@ -157,6 +159,30 @@ const linuxBootId = (): string | undefined => {
       .trim()
       .toLowerCase();
     return /^[0-9a-f-]{36}$/.test(value) ? value : undefined;
+  } catch {
+    return undefined;
+  }
+};
+
+/** Read the boot identity without a wall-clock comparison. */
+export const processBootIdentity = (): string | undefined => {
+  if (process.platform === "linux") return linuxBootId();
+  if (process.platform !== "darwin") return undefined;
+  try {
+    const result = spawnSync(
+      "/usr/sbin/sysctl",
+      ["-n", "kern.bootsessionuuid"],
+      {
+        encoding: "utf8",
+        timeout: 1500,
+        env: { ...process.env, LC_ALL: "C" },
+      },
+    );
+    if (result.error || result.status !== 0) return undefined;
+    const value = result.stdout.trim().toLowerCase();
+    return /^[0-9a-f]{8}(?:-[0-9a-f]{4}){3}-[0-9a-f]{12}$/.test(value)
+      ? value
+      : undefined;
   } catch {
     return undefined;
   }
@@ -332,11 +358,12 @@ const windowsProcessStartIdentity = (
  */
 export const processStartIdentity = (
   pid: number,
+  budgetMs = 1500,
 ): string | null | undefined => {
   if (!Number.isSafeInteger(pid) || pid <= 0) return undefined;
   if (process.platform === "win32") return windowsProcessStartIdentity(pid);
   if (process.platform === "linux") return linuxBootScopedIdentity(pid);
-  return posixPsStartIdentity(pid);
+  return posixPsStartIdentity(pid, budgetMs);
 };
 
 /**
@@ -348,21 +375,48 @@ export const processStartIdentity = (
  */
 export const legacyProcessStartIdentity = (
   pid: number,
+  budgetMs = 1500,
 ): string | null | undefined => {
   if (!Number.isSafeInteger(pid) || pid <= 0) return undefined;
   if (process.platform === "win32") return windowsProcessStartIdentity(pid);
-  return posixPsStartIdentity(pid);
+  return posixPsStartIdentity(pid, budgetMs);
 };
 
-const posixPsStartIdentity = (pid: number): string | null | undefined => {
+const posixPsStartIdentity = (
+  pid: number,
+  budgetMs = 1500,
+): string | null | undefined => {
+  if (budgetMs <= 0) return undefined;
+  let before: ReturnType<typeof observeDarwinProcess> | null = null;
+  if (process.platform === "darwin") {
+    try {
+      before = observeDarwinProcess(pid);
+    } catch {
+      return undefined;
+    }
+  }
+  if (before?.state === "dead") return null;
+  if (before !== null && (before.state !== "live" || before.identity === null))
+    return undefined;
   const [bin, ...args] = processStartCommand(pid);
   if (bin === undefined) return undefined;
   const result = spawnSync(bin, args, {
     encoding: "utf8",
-    timeout: 1500,
+    timeout: Math.max(1, Math.min(1500, budgetMs)),
     windowsHide: true,
     env: { ...process.env, LC_ALL: "C", LANG: "C", TZ: "UTC" },
   });
+  if (before !== null) {
+    let after: ReturnType<typeof observeDarwinProcess>;
+    try {
+      after = observeDarwinProcess(pid);
+    } catch {
+      return undefined;
+    }
+    if (after.state === "dead") return null;
+    if (after.state !== "live" || after.identity !== before.identity)
+      return undefined;
+  }
   // ps missing/unspawnable/hung (EC-3) or a ps that exits nonzero — a
   // busybox-style build that rejects `lstart` (SH-2): degrade to /proc +
   // kill(pid,0) rather than reporting every pid — including dead ones — as
