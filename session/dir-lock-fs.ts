@@ -609,6 +609,10 @@ export function listDirectory(
 // gate that stays interrupted reports busy so the caller retries inside its
 // own deadline.
 const gateInterruptRetries = 4;
+// An interrupted LOCK_UN must be retried: a thrown EINTR would leave a
+// granted claim with no way to release it. A sustained interrupt storm is a
+// fault of its own, so the retry has a bound.
+const gateUnlockInterruptRetries = 10_000;
 const interrupted = (error: unknown): boolean =>
   (error as NodeJS.ErrnoException | undefined)?.code === "EINTR";
 
@@ -639,18 +643,24 @@ export function tryLockGate(handle: TFileHandle): boolean {
 export function unlockGate(handle: TFileHandle): void {
   ensureOpen(handle);
   // LOCK_UN never waits on another process. An interrupted call did not run,
-  // so the lock stays held and the retry is safe. Retry until the call is
-  // not interrupted: a thrown EINTR here would leave a granted claim with no
-  // way to release it. Other errors are real faults and propagate.
-  for (;;) {
+  // so the lock stays held and the retry is safe. A storm of interrupts is a
+  // real fault, not a transient one: bound the retries so the caller can
+  // report and recover instead of spinning forever. Other errors are real
+  // faults and propagate.
+  for (let attempt = 0; ; attempt++) {
     const injected = unlockFaultForTests?.() ?? null;
     if (injected !== null) {
       if (injected !== "EINTR") throw injectedFault(injected);
-      continue;
+    } else {
+      if (n().symbols.flock(handle.fd, 8) >= 0) return; // LOCK_UN
+      const error = nativeError("flock(LOCK_UN)");
+      if (error.code !== "EINTR") throw error;
     }
-    if (n().symbols.flock(handle.fd, 8) >= 0) return; // LOCK_UN
-    const error = nativeError("flock(LOCK_UN)");
-    if (error.code !== "EINTR") throw error;
+    if (attempt >= gateUnlockInterruptRetries - 1)
+      throw Object.assign(
+        new Error("dir-lock-fs: gate unlock stayed interrupted"),
+        { code: "LOCK_UNKNOWN" },
+      );
   }
 }
 

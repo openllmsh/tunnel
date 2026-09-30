@@ -196,28 +196,46 @@ const terminalize = (
   if (!isTerminal(ctx, claim))
     mkdirRecord(ctx.control, terminalName(claim, released));
 };
+/**
+ * Drop the worker and vendor-group records of a transaction whose claim is
+ * ending. A live vendor group keeps the claim: throw so the caller keeps
+ * the records for recovery. A missing worker record is already clean.
+ */
+const removeClaimWorker = (
+  ctx: TLockControl,
+  transactionName: string,
+  claim: TDirLockClaim,
+  worker: TDirLockOptions["worker"],
+): void => {
+  if (!worker) return;
+  const transaction = childDirectory(ctx.control, transactionName);
+  try {
+    if (
+      ctx.kind === "v" &&
+      childExists(transaction, "groups.v3") &&
+      !removeEndedVendorGroups(transaction, true, claim.start)
+    )
+      throw new LockUnknownError("vendor process group has not ended");
+    const workerName = `worker.v3.${encodeDirLockActor(worker)}`;
+    if (childExists(transaction, workerName))
+      removeEmptyChild(transaction, workerName);
+    if (ctx.kind === "v" && childExists(transaction, "groups.v3"))
+      removeEndedVendorGroups(transaction, false, claim.start);
+  } finally {
+    close(transaction);
+  }
+};
 const retryCancellations = (ctx: TLockControl): void => {
   for (const [key, pending] of pendingCancellations) {
     if (pending.path !== ctx.path) continue;
     terminalize(ctx, pending.claim, false);
-    if (pending.transaction && pending.worker) {
-      const transaction = childDirectory(ctx.control, pending.transaction);
-      try {
-        if (
-          ctx.kind === "v" &&
-          childExists(transaction, "groups.v3") &&
-          !removeEndedVendorGroups(transaction, true, pending.claim.start)
-        )
-          throw new LockUnknownError("vendor process group has not ended");
-        const workerName = `worker.v3.${encodeDirLockActor(pending.worker)}`;
-        if (childExists(transaction, workerName))
-          removeEmptyChild(transaction, workerName);
-        if (ctx.kind === "v" && childExists(transaction, "groups.v3"))
-          removeEndedVendorGroups(transaction, false, pending.claim.start);
-      } finally {
-        close(transaction);
-      }
-    }
+    if (pending.transaction)
+      removeClaimWorker(
+        ctx,
+        pending.transaction,
+        pending.claim,
+        pending.worker,
+      );
     pendingCancellations.delete(key);
   }
 };
@@ -556,13 +574,15 @@ type TGrantedClaim = {
   readonly claim: TDirLockClaim;
   readonly transaction: string;
   readonly generation: string;
+  readonly worker: TDirLockOptions["worker"];
 };
 /**
  * Roll back a claim whose release never reached the caller. The owner is
  * published and bound to this process, so no other actor can release it.
- * Mark the claim terminal and clean its records under the gate. When the
- * current descriptors are unusable, reopen the control once. A failure keeps
- * the records for recovery.
+ * Mark the claim terminal, drop the worker records the same way a release
+ * does, and clean its records under the gate. A cleanup that reports false
+ * is a failed sweep: retry once on a fresh control. A failure keeps the
+ * records for recovery.
  */
 const rollbackGrantedClaim = (
   ctx: TLockControl,
@@ -572,14 +592,19 @@ const rollbackGrantedClaim = (
   const sweep = (control: TLockControl): boolean =>
     withLockGate(control, () => {
       terminalize(control, granted.claim, false);
-      cleanupClaim(
+      removeClaimWorker(
+        control,
+        granted.transaction,
+        granted.claim,
+        granted.worker,
+      );
+      return cleanupClaim(
         control,
         granted.dir,
         granted.claim,
         granted.transaction,
         granted.generation,
       );
-      return true;
     }) === true;
   let done = false;
   try {
@@ -839,6 +864,7 @@ const acquireAttemptGated = (
         claim,
         transaction,
         generation,
+        worker: opts.worker,
       };
       const capturedDir = dir;
       const capturedTransaction = transaction;
@@ -853,30 +879,8 @@ const acquireAttemptGated = (
           const wait = new Int32Array(new SharedArrayBuffer(4));
           for (let attempt = 0; attempt <= 100; attempt++) {
             const released = withLockGate(ctx, () => {
-              if (opts.worker) {
-                const planDir = childDirectory(
-                  ctx.control,
-                  capturedTransaction,
-                );
-                try {
-                  if (
-                    ctx.kind === "v" &&
-                    childExists(planDir, "groups.v3") &&
-                    !removeEndedVendorGroups(planDir, true, claim.start)
-                  )
-                    throw new LockUnknownError(
-                      "vendor process group has not ended",
-                    );
-                  removeEmptyChild(
-                    planDir,
-                    `worker.v3.${encodeDirLockActor(opts.worker)}`,
-                  );
-                  if (ctx.kind === "v" && childExists(planDir, "groups.v3"))
-                    removeEndedVendorGroups(planDir, false, claim.start);
-                } finally {
-                  close(planDir);
-                }
-              }
+              if (opts.worker)
+                removeClaimWorker(ctx, capturedTransaction, claim, opts.worker);
               terminalize(ctx, claim, true);
               terminalPublished = true;
               opts.onStep?.("before-release", ctx.path);
@@ -922,23 +926,8 @@ const acquireAttemptGated = (
       });
       try {
         terminalize(ctx, claim, false);
-        if (transaction && opts.worker) {
-          const planDir = childDirectory(ctx.control, transaction);
-          try {
-            if (
-              ctx.kind === "v" &&
-              childExists(planDir, "groups.v3") &&
-              !removeEndedVendorGroups(planDir, true, claim.start)
-            )
-              throw new LockUnknownError("vendor process group has not ended");
-            const worker = `worker.v3.${encodeDirLockActor(opts.worker)}`;
-            if (childExists(planDir, worker)) removeEmptyChild(planDir, worker);
-            if (ctx.kind === "v" && childExists(planDir, "groups.v3"))
-              removeEndedVendorGroups(planDir, false, claim.start);
-          } finally {
-            close(planDir);
-          }
-        }
+        if (transaction)
+          removeClaimWorker(ctx, transaction, claim, opts.worker);
         pendingCancellations.delete(pendingKey);
         if (dir && transaction && generation)
           cleanupClaim(ctx, dir, claim, transaction, generation);
