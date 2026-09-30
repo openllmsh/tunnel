@@ -149,10 +149,13 @@ export const runInternalLockControl = async (
           return 74;
         const action = readFileSync(request, "utf8");
         if (kind === "v" && action === "preserve\n") return 74;
-        if (action !== "release\n") return 2;
-        activeRelease();
-        release = null;
-        return 0;
+        if (action === "release\n") {
+          activeRelease();
+          release = null;
+          return 0;
+        }
+        // Other content can be the open phase of a non-atomic write. Keep
+        // polling until the deadline instead of failing the request.
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
       }
