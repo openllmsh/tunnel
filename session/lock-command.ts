@@ -31,6 +31,12 @@ const envLockMs = (name: string, fallback: number): number => {
 const writeResponse = (path: string, code: number): void => {
   writeLockReply(path, code);
 };
+// A `>` write shows the request file empty or as a strict prefix of a valid
+// action between the truncate and the flush. A live writer finishes far
+// faster than this bound. A writer that dies mid-write stops changing the
+// file, so the helper fails the request after this grace instead of polling
+// until the whole wait bound.
+const partialRequestGraceMs = 3_000;
 export const runInternalLockControl = async (
   args: readonly string[],
 ): Promise<number> => {
@@ -133,6 +139,11 @@ export const runInternalLockControl = async (
     const activeRelease = release;
     writeResponse(response, 0);
     const deadline = performance.now() + maxWaitMs;
+    // The stamp identifies the last observed state of a partial payload. A
+    // write that still advances changes the mtime or the bytes, so each
+    // change restarts the grace. An unchanged stamp means the write stalled.
+    let partialStamp = "";
+    let partialDeadline = 0;
     for (
       let attempt = 0;
       attempt < Math.ceil(maxWaitMs / 50) && performance.now() < deadline;
@@ -154,19 +165,24 @@ export const runInternalLockControl = async (
           release = null;
           return 0;
         }
-        // A `>` write exposes the empty file and strict prefixes of a valid
-        // action mid-write. Keep polling only for those. Any other payload
-        // is a finished write the caller cannot repair: the worker is
-        // blocked waiting on this helper, so waiting the full bound would
-        // wedge it. Fail now; the claim ends with this process.
+        // Empty content and strict prefixes of a valid action can still grow
+        // into a finished write. Any other payload is a finished write the
+        // caller cannot repair: the worker is blocked waiting on this
+        // helper, so waiting the full bound would wedge it. Fail now; the
+        // claim ends with this process.
         if (
-          action !== "" &&
           !"release\n".startsWith(action) &&
           !(kind === "v" && "preserve\n".startsWith(action))
         )
           return 74;
+        const stamp = `${stat.mtimeMs}:${action}`;
+        if (stamp !== partialStamp) {
+          partialStamp = stamp;
+          partialDeadline = performance.now() + partialRequestGraceMs;
+        } else if (performance.now() >= partialDeadline) return 74;
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+        partialStamp = "";
       }
       if (processIdentityStatus(worker.pid, worker.start) === "dead") {
         // A vendor worker can leave its detached process group alive. Its
