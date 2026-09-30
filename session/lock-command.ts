@@ -154,8 +154,17 @@ export const runInternalLockControl = async (
           release = null;
           return 0;
         }
-        // Other content can be the open phase of a non-atomic write. Keep
-        // polling until the deadline instead of failing the request.
+        // A `>` write exposes the empty file and strict prefixes of a valid
+        // action mid-write. Keep polling only for those. Any other payload
+        // is a finished write the caller cannot repair: the worker is
+        // blocked waiting on this helper, so waiting the full bound would
+        // wedge it. Fail now; the claim ends with this process.
+        if (
+          action !== "" &&
+          !"release\n".startsWith(action) &&
+          !(kind === "v" && "preserve\n".startsWith(action))
+        )
+          return 74;
       } catch (error) {
         if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
       }
