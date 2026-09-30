@@ -28,12 +28,26 @@ export type TDirLockFsEvent = Readonly<{
   fd?: number;
 }>;
 let testHook: ((event: TDirLockFsEvent) => void) | null = null;
+let unlockFaultForTests: (() => string | null) | null = null;
 const fdPaths = new Map<number, string>();
 export function setDirLockFsHookForTests(
   hook: ((event: TDirLockFsEvent) => void) | null,
 ): void {
   testHook = hook;
 }
+/**
+ * Test seam. When set, the hook runs before each LOCK_UN attempt and returns
+ * an errno code to fail that attempt, or null for the real call. An injected
+ * failure does not touch the descriptor: the gate stays locked, as a real
+ * interrupted call would leave it. Clear with setDirLockUnlockFaultForTests(null).
+ */
+export function setDirLockUnlockFaultForTests(
+  fault: (() => string | null) | null,
+): void {
+  unlockFaultForTests = fault;
+}
+const injectedFault = (code: string): Error & { code: string } =>
+  Object.assign(new Error(`dir-lock-fs: injected fault: ${code}`), { code });
 function emit(event: TDirLockFsEvent): void {
   testHook?.(event);
 }
@@ -624,11 +638,19 @@ export function tryLockGate(handle: TFileHandle): boolean {
 
 export function unlockGate(handle: TFileHandle): void {
   ensureOpen(handle);
-  for (let attempt = 0; ; attempt++) {
+  // LOCK_UN never waits on another process. An interrupted call did not run,
+  // so the lock stays held and the retry is safe. Retry until the call is
+  // not interrupted: a thrown EINTR here would leave a granted claim with no
+  // way to release it. Other errors are real faults and propagate.
+  for (;;) {
+    const injected = unlockFaultForTests?.() ?? null;
+    if (injected !== null) {
+      if (injected !== "EINTR") throw injectedFault(injected);
+      continue;
+    }
     if (n().symbols.flock(handle.fd, 8) >= 0) return; // LOCK_UN
     const error = nativeError("flock(LOCK_UN)");
-    if (error.code !== "EINTR" || attempt === gateInterruptRetries - 1)
-      throw error;
+    if (error.code !== "EINTR") throw error;
   }
 }
 
