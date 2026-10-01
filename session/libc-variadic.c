@@ -4,7 +4,15 @@
    a bound open/fcntl can see a garbage mode or command argument. Declaring
    the real variadic prototypes here lets the compiler place every argument
    where the ABI expects it. Contract: each wrapper returns the libc result
-   when >= 0, otherwise -errno captured inside C right after the call. */
+   when >= 0, otherwise -errno captured inside C right after the call.
+
+   Verified 2026-10-01 on darwin-arm64 (macOS 27.0.1, compiled bun 1.4.2
+   binary, umask 0, no fchmod): open/openat through these wrappers create
+   files with exactly the requested mode (0640, 0604, 0711, 0600) and fcntl
+   round-trips its F_SETFD/F_SETFL argument, while the beta.3 fixed-arity
+   bun:ffi open() created 0750 for a requested 0640.
+   tests/tunnel/dir-lock-umask.test.ts repeats the mode check on every POSIX
+   host. */
 
 #if defined(LIBC_DARWIN)
 extern int *__error(void);
