@@ -1,6 +1,7 @@
 import { randomBytes } from "node:crypto";
 import type { BigIntStats } from "node:fs";
 import {
+  fchmodSync,
   fsyncSync,
   lstatSync,
   readlinkSync,
@@ -338,24 +339,11 @@ export const openLockControl = (
       }
     }
     let stat = statDescriptor(gate.fd);
-    if (
-      stat.isFile() &&
-      stat.uid === uid &&
-      stat.nlink === 1n &&
-      (stat.mode & 0o7777n) === 0n
-    ) {
+    if (isRepairableGateLeftover(stat, uid)) {
       // Root opens a mode-0000 gate without EACCES, so the leftover repair
-      // runs here instead. The reopened descriptor pins the checked inode —
-      // a rename under the name cannot swap which inode gets repaired.
-      const { dev, ino } = stat;
-      chmodChild(control, "meta.v3.lock", 0o600);
+      // runs here instead, on the open descriptor: it is the checked inode.
+      fchmodSync(gate.fd, 0o600);
       stat = statDescriptor(gate.fd);
-      if (
-        stat.dev !== dev ||
-        stat.ino !== ino ||
-        (stat.mode & 0o7777n) !== 0o600n
-      )
-        throw new LockUnknownError("unsafe metadata gate");
     }
     if (
       !stat.isFile() ||
