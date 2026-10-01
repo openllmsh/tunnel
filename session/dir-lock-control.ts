@@ -1,13 +1,13 @@
 import { randomBytes } from "node:crypto";
+import type { BigIntStats } from "node:fs";
 import {
-  fchmodSync,
   fsyncSync,
   lstatSync,
   readlinkSync,
   readSync,
   writeFileSync,
 } from "node:fs";
-import { basename, dirname, isAbsolute, resolve, sep } from "node:path";
+import { basename, dirname, isAbsolute, join, resolve, sep } from "node:path";
 import type { TDirLockKind } from "./dir-lock-format";
 import {
   formatDirLockControlName,
@@ -261,11 +261,21 @@ export const openPinnedPath = (path: string): TDirectoryHandle => {
     throw error;
   }
 };
+/** The only gate shape the repair may touch: the mode-0000 leftover of the beta.3 variadic open() bug — own regular file, one link, no permission bits. */
+export const isRepairableGateLeftover = (
+  stat: BigIntStats,
+  uid: bigint,
+): boolean =>
+  stat.isFile() &&
+  (stat.mode & 0o7777n) === 0n &&
+  stat.nlink === 1n &&
+  stat.uid === uid;
 export const openLockControl = (
   path: string,
   kind: TLockKind,
 ): TLockControl => {
   const base = basename(path);
+  const uid = BigInt(process.getuid?.() ?? -1);
   if (
     !isAbsolute(path) ||
     Buffer.byteLength(base) > 160 ||
@@ -278,10 +288,7 @@ export const openLockControl = (
   let gate: TFileHandle | undefined;
   try {
     const parentStat = statDescriptor(parent.fd);
-    if (
-      parentStat.uid !== BigInt(process.getuid?.() ?? -1) ||
-      (parentStat.mode & 0o022n) !== 0n
-    )
+    if (parentStat.uid !== uid || (parentStat.mode & 0o022n) !== 0n)
       throw new LockUnknownError(
         `lock parent is writable by another user: ${dirname(path)}; fix with: chmod go-w '${dirname(path)}'`,
       );
@@ -301,32 +308,58 @@ export const openLockControl = (
         gate = openChild(control, "meta.v3.lock", posixOpenFlags().O_RDWR, 0);
       } catch (openError) {
         if (errorCode(openError) !== "EACCES") throw openError;
-        // A gate left mode 0000 by a broken build opens EACCES forever. Repair
-        // the mode through the pinned control directory and retry once; when
-        // the repair itself fails, the original open error is the real report.
+        // Check before any chmod: only the beta.3 mode-0000 leftover (own
+        // regular file, one link, no permission bits) may be repaired. Every
+        // other mode, owner, or link count keeps the original EACCES.
+        let leftover: BigIntStats;
+        try {
+          leftover = lstatSync(
+            join(
+              physicalSystemPath(dirname(path)),
+              formatDirLockControlName(base),
+              "meta.v3.lock",
+            ),
+            { bigint: true },
+          );
+        } catch {
+          throw openError;
+        }
+        if (!isRepairableGateLeftover(leftover, uid)) throw openError;
         try {
           chmodChild(control, "meta.v3.lock", 0o600);
         } catch {
           throw openError;
         }
         gate = openChild(control, "meta.v3.lock", posixOpenFlags().O_RDWR, 0);
+        const reopened = statDescriptor(gate.fd);
+        // The inode the repair widened must be the inode that was checked.
+        if (reopened.dev !== leftover.dev || reopened.ino !== leftover.ino)
+          throw new LockUnknownError("unsafe metadata gate");
       }
     }
     let stat = statDescriptor(gate.fd);
     if (
       stat.isFile() &&
-      stat.uid === BigInt(process.getuid?.() ?? -1) &&
+      stat.uid === uid &&
       stat.nlink === 1n &&
-      (stat.mode & 0o7777n) !== 0o600n
+      (stat.mode & 0o7777n) === 0n
     ) {
-      // Normalize a gate that predates the create-time mode pin (or was
-      // loosened afterwards) back to the protocol mode.
-      fchmodSync(gate.fd, 0o600);
+      // Root opens a mode-0000 gate without EACCES, so the leftover repair
+      // runs here instead. The reopened descriptor pins the checked inode —
+      // a rename under the name cannot swap which inode gets repaired.
+      const { dev, ino } = stat;
+      chmodChild(control, "meta.v3.lock", 0o600);
       stat = statDescriptor(gate.fd);
+      if (
+        stat.dev !== dev ||
+        stat.ino !== ino ||
+        (stat.mode & 0o7777n) !== 0o600n
+      )
+        throw new LockUnknownError("unsafe metadata gate");
     }
     if (
       !stat.isFile() ||
-      stat.uid !== BigInt(process.getuid?.() ?? -1) ||
+      stat.uid !== uid ||
       (stat.mode & 0o077n) !== 0n ||
       stat.nlink !== 1n
     )
