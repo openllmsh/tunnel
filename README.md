@@ -32,21 +32,21 @@ Depends only on [`@openllmsh/protocol`](https://github.com/openllmsh/protocol).
 bun install github:openllmsh/tunnel # follows the default branch (see below)
 ```
 
-The current preview is `v2.8.0-beta.3`. Pin the tag for a fixed version —
+The current preview is `v2.8.0-beta.4`. Pin the tag for a fixed version —
 tags are immutable:
 
 ```sh
-bun install github:openllmsh/tunnel#v2.8.0-beta.3
+bun install github:openllmsh/tunnel#v2.8.0-beta.4
 ```
 
 Each prerelease also pushes a durable branch named after the bare version
-(`github:openllmsh/tunnel#2.8.0-beta.3`). A later prerelease never moves
+(`github:openllmsh/tunnel#2.8.0-beta.4`). A later prerelease never moves
 an earlier one's branch or tag, and no prerelease touches `main`.
 
 This repository keeps `prerelease` as its default branch (a frozen snapshot
 from before per-release branches existed). A bare
 `github:openllmsh/tunnel` install follows that branch — pin the tag or the
-`2.8.0-beta.3` branch for the current preview, and `main` for stable.
+`2.8.0-beta.4` branch for the current preview, and `main` for stable.
 
 ## License
 
