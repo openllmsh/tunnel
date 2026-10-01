@@ -1,5 +1,6 @@
 import { randomBytes } from "node:crypto";
 import {
+  fchmodSync,
   fsyncSync,
   lstatSync,
   readlinkSync,
@@ -15,6 +16,7 @@ import {
 } from "./dir-lock-format";
 import type { TDirectoryHandle, TFileHandle } from "./dir-lock-fs";
 import {
+  chmodChild,
   close,
   linkChild,
   listDirectory,
@@ -280,7 +282,9 @@ export const openLockControl = (
       parentStat.uid !== BigInt(process.getuid?.() ?? -1) ||
       (parentStat.mode & 0o022n) !== 0n
     )
-      throw new LockUnknownError("lock parent is writable by another user");
+      throw new LockUnknownError(
+        `lock parent is writable by another user: ${dirname(path)}; fix with: chmod go-w '${dirname(path)}'`,
+      );
     control = ensureDirectory(parent, formatDirLockControlName(base));
     try {
       gate = openChild(
@@ -293,9 +297,33 @@ export const openLockControl = (
       );
     } catch (error) {
       if (errorCode(error) !== "EEXIST") throw error;
-      gate = openChild(control, "meta.v3.lock", posixOpenFlags().O_RDWR, 0);
+      try {
+        gate = openChild(control, "meta.v3.lock", posixOpenFlags().O_RDWR, 0);
+      } catch (openError) {
+        if (errorCode(openError) !== "EACCES") throw openError;
+        // A gate left mode 0000 by a broken build opens EACCES forever. Repair
+        // the mode through the pinned control directory and retry once; when
+        // the repair itself fails, the original open error is the real report.
+        try {
+          chmodChild(control, "meta.v3.lock", 0o600);
+        } catch {
+          throw openError;
+        }
+        gate = openChild(control, "meta.v3.lock", posixOpenFlags().O_RDWR, 0);
+      }
     }
-    const stat = statDescriptor(gate.fd);
+    let stat = statDescriptor(gate.fd);
+    if (
+      stat.isFile() &&
+      stat.uid === BigInt(process.getuid?.() ?? -1) &&
+      stat.nlink === 1n &&
+      (stat.mode & 0o7777n) !== 0o600n
+    ) {
+      // Normalize a gate that predates the create-time mode pin (or was
+      // loosened afterwards) back to the protocol mode.
+      fchmodSync(gate.fd, 0o600);
+      stat = statDescriptor(gate.fd);
+    }
     if (
       !stat.isFile() ||
       stat.uid !== BigInt(process.getuid?.() ?? -1) ||

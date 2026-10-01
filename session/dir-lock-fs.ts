@@ -1,6 +1,7 @@
 import type { BigIntStats } from "node:fs";
-import { closeSync, fstatSync } from "node:fs";
+import { closeSync, fchmodSync, fstatSync } from "node:fs";
 import { join } from "node:path";
+import { libcVariadic } from "./libc-variadic";
 
 export type TDirectoryGeneration = Readonly<{ dev: bigint; ino: bigint }>;
 export type TDirectoryHandle = {
@@ -20,6 +21,7 @@ export type TDirLockFsEvent = Readonly<{
     | "linkChild"
     | "unlinkChild"
     | "removeEmptyChild"
+    | "chmodChild"
     | "listDirectory"
     | "flockGate";
   path?: string;
@@ -67,6 +69,7 @@ type TNativeFlags = Readonly<{
   O_NOFOLLOW: number;
   O_CLOEXEC: number;
   AT_REMOVEDIR: number;
+  AT_SYMLINK_NOFOLLOW: number;
 }>;
 
 const linuxX64: TNativeFlags = {
@@ -80,6 +83,7 @@ const linuxX64: TNativeFlags = {
   O_NOFOLLOW: 0x20000,
   O_CLOEXEC: 0x80000,
   AT_REMOVEDIR: 0x200,
+  AT_SYMLINK_NOFOLLOW: 0x100,
 };
 const linuxArm64: TNativeFlags = {
   ...linuxX64,
@@ -97,6 +101,7 @@ const darwin: TNativeFlags = {
   O_NOFOLLOW: 0x100,
   O_CLOEXEC: 0x1000000,
   AT_REMOVEDIR: 0x80,
+  AT_SYMLINK_NOFOLLOW: 0x20,
 };
 
 function target(): {
@@ -160,14 +165,6 @@ function loadNative() {
   const ffi = require("bun:ffi") as typeof import("bun:ffi");
   const { FFIType } = ffi;
   const lib = ffi.dlopen(abi.library, {
-    open: {
-      args: [FFIType.ptr, FFIType.i32, FFIType.i32],
-      returns: FFIType.i32,
-    },
-    openat: {
-      args: [FFIType.i32, FFIType.ptr, FFIType.i32, FFIType.i32],
-      returns: FFIType.i32,
-    },
     mkdirat: {
       args: [FFIType.i32, FFIType.ptr, FFIType.i32],
       returns: FFIType.i32,
@@ -180,7 +177,6 @@ function loadNative() {
       args: [FFIType.i32, FFIType.ptr, FFIType.i32],
       returns: FFIType.i32,
     },
-    fcntl: { args: [FFIType.i32, FFIType.i32], returns: FFIType.i32 },
     flock: { args: [FFIType.i32, FFIType.i32], returns: FFIType.i32 },
     getpgrp: { args: [], returns: FFIType.i32 },
     closedir: { args: [FFIType.ptr], returns: FFIType.i32 },
@@ -256,8 +252,8 @@ const errnoCodes: Record<number, string> = {
 
 function nativeError(
   operation: string,
+  number = errno(),
 ): Error & { errno: number; code: string } {
-  const number = errno();
   const darwinCode = n().abi.darwin
     ? { 35: "EAGAIN", 45: "ENOTSUP", 62: "ELOOP", 66: "ENOTEMPTY" }[number]
     : undefined;
@@ -269,13 +265,13 @@ function nativeError(
 }
 
 function checkCloexec(fd: number): void {
-  const value = n().symbols.fcntl(fd, 1); // F_GETFD
-  if (value < 0) throw nativeError("fcntl(F_GETFD)");
+  const value = libcVariadic().libcFcntl(fd, 1, 0n); // F_GETFD
+  if (value < 0) throw nativeError("fcntl(F_GETFD)", -value);
   if ((value & 1) === 0) throw new Error("dir-lock-fs: FD_CLOEXEC missing");
 }
 
 function withNewFd<T>(fd: number, operation: (fd: number) => T): T {
-  if (fd < 0) throw nativeError("open");
+  if (fd < 0) throw nativeError("open", -fd);
   try {
     return operation(fd);
   } catch (error) {
@@ -314,7 +310,7 @@ export function openDirectory(path: string): TDirectoryHandle {
   const bytes = cString(path);
   emit({ phase: "before", operation: "openDirectory", path });
   return withNewFd(
-    v.symbols.open(
+    libcVariadic().libcOpen(
       v.ffi.ptr(bytes),
       f.O_RDONLY | f.O_DIRECTORY | f.O_NOFOLLOW | f.O_CLOEXEC,
       0,
@@ -341,7 +337,7 @@ export function openChild(
   const path = childPath(dir, name);
   emit({ phase: "before", operation: "openChild", path, name, dirFd: dir.fd });
   return withNewFd(
-    v.symbols.openat(
+    libcVariadic().libcOpenat(
       dir.fd,
       v.ffi.ptr(bytes),
       flags |
@@ -352,6 +348,13 @@ export function openChild(
     ),
     (fd) => {
       checkCloexec(fd);
+      // O_CREAT|O_EXCL creates the file: pin its mode past the umask so a
+      // permissive caller cannot leave a group-writable gate.
+      if (
+        (flags & v.abi.flags.O_CREAT) !== 0 &&
+        (flags & v.abi.flags.O_EXCL) !== 0
+      )
+        fchmodSync(fd, mode);
       if (path !== undefined) fdPaths.set(fd, path);
       emit({
         phase: "after",
@@ -383,7 +386,7 @@ export function openDirectoryChild(
     dirFd: dir.fd,
   });
   return withNewFd(
-    v.symbols.openat(
+    libcVariadic().libcOpenat(
       dir.fd,
       v.ffi.ptr(bytes),
       f.O_RDONLY | f.O_DIRECTORY | f.O_NOFOLLOW | f.O_CLOEXEC,
@@ -498,6 +501,26 @@ export function removeEmptyChild(parent: TDirectoryHandle, name: string): void {
   });
 }
 
+export function chmodChild(
+  dir: TDirectoryHandle,
+  name: string,
+  mode: number,
+): void {
+  ensureOpen(dir);
+  const v = n();
+  const bytes = basename(name);
+  const path = childPath(dir, name);
+  emit({ phase: "before", operation: "chmodChild", path, name, dirFd: dir.fd });
+  const result = libcVariadic().libcFchmodat(
+    dir.fd,
+    v.ffi.ptr(bytes),
+    mode,
+    v.abi.flags.AT_SYMLINK_NOFOLLOW,
+  );
+  if (result < 0) throw nativeError("fchmodat(AT_SYMLINK_NOFOLLOW)", -result);
+  emit({ phase: "after", operation: "chmodChild", path, name, dirFd: dir.fd });
+}
+
 export function listDirectory(
   dir: TDirectoryHandle,
   maxEntries = 4096,
@@ -510,13 +533,13 @@ export function listDirectory(
   const path = fdPaths.get(dir.fd);
   emit({ phase: "before", operation: "listDirectory", path, dirFd: dir.fd });
   const dot = cString(".");
-  const fd = v.symbols.openat(
+  const fd = libcVariadic().libcOpenat(
     dir.fd,
     v.ffi.ptr(dot),
     f.O_RDONLY | f.O_DIRECTORY | f.O_NOFOLLOW | f.O_CLOEXEC,
     0,
   );
-  if (fd < 0) throw nativeError("openat(.)");
+  if (fd < 0) throw nativeError("openat(.)", -fd);
   if (path !== undefined) fdPaths.set(fd, path);
   let ownedByStream = false;
   try {
