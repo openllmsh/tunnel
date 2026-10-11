@@ -133,7 +133,7 @@ const isStreamResetCode = (value: unknown): value is TStreamResetCode =>
 /**
  * True when an `AbortSignal`'s `.reason` is TIMEOUT-shaped rather than a
  * genuine caller cancellation — mirrors the `name`/message heuristic
- * `packages/daemon/src/net-error.ts`'s `classifyOriginThrow` already uses
+ * `packages/cli/daemon/src/net-error.ts`'s `classifyOriginThrow` already uses
  * for origin-fetch failures (kept as a small local copy, not an import: the
  * dependency graph is `daemon → tunnel`, never the reverse). Recognizes
  * `AbortSignal.timeout(ms)`'s own `TimeoutError`-named reason, so a signal

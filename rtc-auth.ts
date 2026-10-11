@@ -28,7 +28,7 @@
  *     with `cid=channel_id` and `aud=daemon_pubkey`.
  *
  * Hosts supply seal/open via the existing sealed-box implementations
- * (`lib/daemon-seal.ts` / `packages/daemon/src/keypair.ts`). Fingerprint
+ * (`lib/daemon-seal.ts` / `packages/cli/daemon/src/keypair.ts`). Fingerprint
  * strings are normalized (lowercase, strip separators) so SDP
  * `a=fingerprint:sha-256 AA:BB:…` and bare hex compare equal.
  */
