@@ -9,7 +9,10 @@
  * Transport (RTC vs relay mux, how the channel was opened) stays with the
  * caller; this owns the request mapping and the response shape.
  */
-import type { TTunnelForwardHeaders, TTunnelSurface } from "@openllmsh/protocol";
+import type {
+  TTunnelForwardHeaders,
+  TTunnelSurface,
+} from "@openllmsh/protocol";
 import {
   ALLOWED_TUNNEL_ACCEPT,
   isAllowedTunnelRequestContentType,
@@ -22,7 +25,9 @@ const isAccept = (value: string): value is TAccept =>
   (ALLOWED_TUNNEL_ACCEPT as ReadonlyArray<string>).includes(value);
 
 /** Map inbound HTTP headers to the mux's closed forward-header struct. */
-export const fleetForwardHeaders = (headers: Headers): TTunnelForwardHeaders => {
+export const fleetForwardHeaders = (
+  headers: Headers,
+): TTunnelForwardHeaders => {
   const accept = headers.get("accept")?.split(",", 1)[0]?.trim();
   const contentType = headers.get("content-type") ?? "";
   const anthropicVersion = headers.get("anthropic-version");
