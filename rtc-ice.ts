@@ -17,8 +17,8 @@
  * Linux hosts with a working NSS mDNS plugin) decides LAN-ness once; when
  * the name does not resolve quickly, this and every later `.local`
  * candidate is skipped IMMEDIATELY instead of feeding werift another 10 s
- * probe. The verdict is cached process-wide because LAN-ness does not change
- * between candidates of one connection.
+ * probe. The verdict is cached on the preflight instance because LAN-ness
+ * does not change between candidates of one connection.
  *
  * Non-`.local` candidates are never touched.
  */
@@ -26,12 +26,6 @@
 const MDNS_PREFLIGHT_TIMEOUT_MS = 250;
 const MDNS_VERDICT_TTL_MS = 60_000;
 const MDNS_NEGATIVE_VERDICT_TTL_MS = 1_000;
-
-/** Cached preflight verdict: true = `.local` resolved quickly (LAN) → keep
- *  feeding candidates to werift; false = skip them fast. */
-let mdnsVerdict: boolean | null = null;
-let mdnsVerdictAtMs: number | null = null;
-let mdnsPreflightInFlight: Promise<boolean> | null = null;
 
 const mdnsHostFromCandidate = (candidate: string): string | null => {
   const match = /(?:^|\s)([a-z0-9-]+\.local)(?:\s|$)/i.exec(candidate);
@@ -45,21 +39,90 @@ export const isMdnsCandidate = (init: {
   typeof init.candidate === "string" &&
   mdnsHostFromCandidate(init.candidate) !== null;
 
-const lookupOnce = async (host: string): Promise<boolean> => {
-  const { lookup } = await import("node:dns/promises");
-  return new Promise<boolean>((resolve) => {
-    const timer = setTimeout(() => resolve(false), MDNS_PREFLIGHT_TIMEOUT_MS);
-    lookup(host)
-      .then(() => {
-        clearTimeout(timer);
-        resolve(true);
-      })
-      .catch(() => {
-        clearTimeout(timer);
-        resolve(false);
-      });
-  });
+export type TMdnsLookup = (host: string) => Promise<unknown>;
+
+export type TMdnsPreflight = {
+  readonly preflight: (init: {
+    readonly candidate?: string | null;
+  }) => Promise<boolean>;
 };
+
+export type TMdnsPreflightDeps = {
+  readonly lookup?: TMdnsLookup;
+  readonly now?: () => number;
+  readonly setTimer?: (
+    callback: () => void,
+    ms: number,
+  ) => ReturnType<typeof setTimeout>;
+  readonly clearTimer?: (timer: ReturnType<typeof setTimeout>) => void;
+};
+
+/**
+ * Build an mDNS ICE preflight with its own verdict cache. Production uses
+ * {@link defaultMdnsPreflight}; tests build a fresh one per case.
+ */
+export const createMdnsPreflight = (
+  deps: TMdnsPreflightDeps = {},
+): TMdnsPreflight => {
+  const now = deps.now ?? (() => Date.now());
+  const setTimer = deps.setTimer ?? setTimeout;
+  const clearTimer = deps.clearTimer ?? clearTimeout;
+  const lookupFn: TMdnsLookup =
+    deps.lookup ??
+    (async (host) => {
+      const { lookup } = await import("node:dns/promises");
+      return lookup(host);
+    });
+
+  let mdnsVerdict: boolean | null = null;
+  let mdnsVerdictAtMs: number | null = null;
+  let mdnsPreflightInFlight: Promise<boolean> | null = null;
+
+  const lookupOnce = async (host: string): Promise<boolean> =>
+    new Promise<boolean>((resolve) => {
+      const timer = setTimer(() => resolve(false), MDNS_PREFLIGHT_TIMEOUT_MS);
+      lookupFn(host)
+        .then(() => {
+          clearTimer(timer);
+          resolve(true);
+        })
+        .catch(() => {
+          clearTimer(timer);
+          resolve(false);
+        });
+    });
+
+  return {
+    async preflight(init): Promise<boolean> {
+      const candidate = init.candidate;
+      if (typeof candidate !== "string") return true;
+      const host = mdnsHostFromCandidate(candidate);
+      if (host === null) return true;
+      if (
+        mdnsVerdict !== null &&
+        mdnsVerdictAtMs !== null &&
+        now() - mdnsVerdictAtMs <
+          (mdnsVerdict ? MDNS_VERDICT_TTL_MS : MDNS_NEGATIVE_VERDICT_TTL_MS)
+      ) {
+        return mdnsVerdict;
+      }
+      if (mdnsPreflightInFlight === null) {
+        mdnsPreflightInFlight = lookupOnce(host)
+          .then((ok) => {
+            mdnsVerdict = ok;
+            mdnsVerdictAtMs = now();
+            return ok;
+          })
+          .finally(() => {
+            mdnsPreflightInFlight = null;
+          });
+      }
+      return mdnsPreflightInFlight;
+    },
+  };
+};
+
+const defaultMdnsPreflight = createMdnsPreflight();
 
 /**
  * Preflight an ICE candidate before handing it to werift. Returns true when
@@ -70,36 +133,4 @@ const lookupOnce = async (host: string): Promise<boolean> => {
  */
 export const preflightIceCandidate = async (init: {
   readonly candidate?: string | null;
-}): Promise<boolean> => {
-  const candidate = init.candidate;
-  if (typeof candidate !== "string") return true;
-  const host = mdnsHostFromCandidate(candidate);
-  if (host === null) return true;
-  if (
-    mdnsVerdict !== null &&
-    mdnsVerdictAtMs !== null &&
-    Date.now() - mdnsVerdictAtMs <
-      (mdnsVerdict ? MDNS_VERDICT_TTL_MS : MDNS_NEGATIVE_VERDICT_TTL_MS)
-  ) {
-    return mdnsVerdict;
-  }
-  if (mdnsPreflightInFlight === null) {
-    mdnsPreflightInFlight = lookupOnce(host)
-      .then((ok) => {
-        mdnsVerdict = ok;
-        mdnsVerdictAtMs = Date.now();
-        return ok;
-      })
-      .finally(() => {
-        mdnsPreflightInFlight = null;
-      });
-  }
-  return mdnsPreflightInFlight;
-};
-
-/** Test-only: clear the cached LAN verdict between cases. */
-export const resetMdnsPreflightForTest = (): void => {
-  mdnsVerdict = null;
-  mdnsVerdictAtMs = null;
-  mdnsPreflightInFlight = null;
-};
+}): Promise<boolean> => defaultMdnsPreflight.preflight(init);
