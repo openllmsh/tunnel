@@ -31,8 +31,11 @@ OPEN, CTRL, and RESET use UTF-8 JSON in P1. DATA is opaque bytes. END has an
 empty payload. WINDOW is exactly one u32 big-endian delta. Numeric constants
 have one home in `codec.ts`:
 
-- maximum payload and initial per-stream credit: 256 KiB;
-- receiver replenishment threshold: 128 KiB;
+- maximum payload and implicit OPEN credit: 256 KiB (frozen — do not raise
+  unilaterally);
+- post-OPEN WINDOW boost: +768 KiB (target receive window 1 MiB; skew-safe —
+  old peers just add the WINDOW delta);
+- receiver replenishment threshold: 64 KiB;
 - stream zero is channel CTRL; odd ids are consumer initiated and even ids are
   daemon initiated.
 

@@ -86,12 +86,17 @@ export const stableChannelId = async (
   return channelId;
 };
 
-/** Wrap one whole WebSocket message. Caller contract violations throw RangeError. */
-export const encodeChannelEnvelope = (
-  channelId: string,
+/**
+ * Wrap one whole WebSocket message using a precomputed 16-byte tag. Prefer this
+ * on hot paths that already cache {@link channelIdToBytes} beside the channel.
+ */
+export const encodeChannelEnvelopeWithTag = (
+  tag: Uint8Array,
   payload: Uint8Array,
 ): Uint8Array => {
-  const tag = channelIdToBytes(channelId);
+  if (tag.byteLength !== CHANNEL_ENVELOPE_TAG_BYTES) {
+    throw new RangeError("channel tag must be 16 bytes");
+  }
   const encoded = new Uint8Array(
     CHANNEL_ENVELOPE_TAG_BYTES + payload.byteLength,
   );
@@ -99,6 +104,13 @@ export const encodeChannelEnvelope = (
   encoded.set(payload, CHANNEL_ENVELOPE_TAG_BYTES);
   return encoded;
 };
+
+/** Wrap one whole WebSocket message. Caller contract violations throw RangeError. */
+export const encodeChannelEnvelope = (
+  channelId: string,
+  payload: Uint8Array,
+): Uint8Array =>
+  encodeChannelEnvelopeWithTag(channelIdToBytes(channelId), payload);
 
 export type TChannelEnvelopeDecodeResult =
   | {

@@ -5,8 +5,26 @@
 
 export const FRAME_HEADER_BYTES = 9;
 export const MAX_PAYLOAD_BYTES = 256 * 1024;
+/**
+ * Implicit per-stream credit at OPEN on every peer. Frozen for skew-safety —
+ * never raise this unilaterally. Newer peers advertise extra credit with an
+ * immediate WINDOW after OPEN ({@link STREAM_WINDOW_BOOST_BYTES}).
+ */
 export const INITIAL_STREAM_WINDOW_BYTES = 256 * 1024;
-export const WINDOW_REPLENISH_THRESHOLD = 128 * 1024;
+/**
+ * Extra receive credit granted right after OPEN via a WINDOW frame. Old peers
+ * accept the WINDOW (additive sendCredit); new peers start receiveCredit at
+ * {@link TARGET_STREAM_WINDOW_BYTES}. Total target window = initial + boost.
+ */
+export const STREAM_WINDOW_BOOST_BYTES = 768 * 1024;
+/** Effective receive window on peers that send the post-OPEN boost. */
+export const TARGET_STREAM_WINDOW_BYTES =
+  INITIAL_STREAM_WINDOW_BYTES + STREAM_WINDOW_BOOST_BYTES;
+/**
+ * Emit WINDOW once this many bytes have been consumed since the last grant.
+ * Lower than half the initial window so high-RTT paths replenish sooner.
+ */
+export const WINDOW_REPLENISH_THRESHOLD = 64 * 1024;
 export const STREAM_ID_CTRL = 0;
 export const MAX_STREAM_ID = 0xffff_ffff;
 
@@ -94,6 +112,18 @@ export const encodeFrame = (frame: TFrame): Uint8Array => {
   view.setUint32(5, frame.payload.byteLength, false);
   encoded.set(frame.payload, FRAME_HEADER_BYTES);
   return encoded;
+};
+
+/**
+ * Cheap mux-frame shape check (header type / length / payload cap) without
+ * allocating a {@link TFrame}. Used by the blind relay forward path.
+ */
+export const isValidMuxFrame = (bytes: Uint8Array): boolean => {
+  const header = peekFrameHeader(bytes);
+  if (header === null) return false;
+  if (!isKnownFrameType(header.type)) return false;
+  if (header.length > MAX_PAYLOAD_BYTES) return false;
+  return header.length === bytes.byteLength - FRAME_HEADER_BYTES;
 };
 
 /** Decode one whole message. Never throws and never allocates from a claimed length. */

@@ -183,6 +183,13 @@ const callerAbortError = (signal: AbortSignal | undefined): Error => {
  * the remote stream so the peer can abort its work. Request-body cancellation
  * only detaches the local reader: the peer may already have sent a response.
  */
+/**
+ * Soft cap on ReadableStream-queued body bytes that still auto-return mux
+ * WINDOW credit. Below this, credit is returned on enqueue (keeps BDP full
+ * under pull lag); above it, credit waits for `pull` so memory stays bounded.
+ */
+const BODY_STREAM_SOFT_BUFFER_BYTES = 512 * 1024;
+
 const bodyFromStream = (
   stream: TMuxStream,
   onReset?: () => void,
@@ -191,7 +198,11 @@ const bodyFromStream = (
   let offData: (() => void) | undefined;
   let offEnd: (() => void) | undefined;
   let offReset: (() => void) | undefined;
-  const delivered: number[] = [];
+  const delivered: Array<{
+    readonly bytes: number;
+    readonly deferred: boolean;
+  }> = [];
+  let queuedBytes = 0;
   let controller: ReadableStreamDefaultController<Uint8Array> | undefined;
   const cleanup = (): void => {
     offData?.();
@@ -205,10 +216,14 @@ const bodyFromStream = (
     start(nextController) {
       controller = nextController;
       offData = stream.onData((bytes) => {
-        // `pull` runs when the queued chunk is read; defer mux credit until then.
-        delivered.push(bytes.byteLength);
+        const nextQueued = queuedBytes + bytes.byteLength;
+        // Defer credit only once the soft buffer would be exceeded — otherwise
+        // auto-consume so WINDOW returns without waiting on downstream pull lag.
+        const defer = nextQueued > BODY_STREAM_SOFT_BUFFER_BYTES;
+        delivered.push({ bytes: bytes.byteLength, deferred: defer });
+        queuedBytes = nextQueued;
         nextController.enqueue(bytes);
-        return false;
+        return defer ? false : undefined;
       });
       offEnd = stream.onEnd(() => {
         cleanup();
@@ -221,8 +236,10 @@ const bodyFromStream = (
       });
     },
     pull() {
-      const bytes = delivered.shift();
-      if (bytes !== undefined) stream.consume(bytes);
+      const item = delivered.shift();
+      if (item === undefined) return;
+      queuedBytes = Math.max(0, queuedBytes - item.bytes);
+      if (item.deferred) stream.consume(item.bytes);
     },
     cancel() {
       cleanup();

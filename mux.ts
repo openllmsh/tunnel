@@ -8,6 +8,8 @@ import {
   isConsumerStreamId,
   MAX_PAYLOAD_BYTES,
   STREAM_ID_CTRL,
+  STREAM_WINDOW_BOOST_BYTES,
+  TARGET_STREAM_WINDOW_BYTES,
   WINDOW_REPLENISH_THRESHOLD,
   windowPayload,
 } from "./codec";
@@ -178,6 +180,15 @@ export const createChannel = (options: TCreateChannelOptions): TMuxChannel => {
     options.duplex.send(encodeFrame({ type, streamId, payload }));
   };
 
+  /**
+   * Advertise {@link TARGET_STREAM_WINDOW_BYTES} without changing the frozen
+   * implicit OPEN window. Old peers just add the WINDOW delta to sendCredit.
+   */
+  const grantWindowBoost = (streamId: number): void => {
+    if (STREAM_WINDOW_BOOST_BYTES <= 0) return;
+    send(FRAME_TYPE.window, streamId, windowPayload(STREAM_WINDOW_BOOST_BYTES));
+  };
+
   const retireStreamState = (state: TStreamState): void => {
     const current = streams.get(state.id);
     if (current !== state) return;
@@ -270,8 +281,12 @@ export const createChannel = (options: TCreateChannelOptions): TMuxChannel => {
     resetHandlers: new Set(),
     ctrlHandlers: new Set(),
     pending: [],
+    // Sender starts at the frozen implicit OPEN window; peer WINDOW frames
+    // (including the post-OPEN boost) raise this.
     sendCredit: INITIAL_STREAM_WINDOW_BYTES,
-    receiveCredit: INITIAL_STREAM_WINDOW_BYTES,
+    // Receiver accepts the boosted target immediately and advertises it with
+    // grantWindowBoost after OPEN so old peers stay interoperable.
+    receiveCredit: TARGET_STREAM_WINDOW_BYTES,
     receivedUnconsumed: 0,
     consumedSinceWindow: 0,
     localEnded: false,
@@ -291,6 +306,37 @@ export const createChannel = (options: TCreateChannelOptions): TMuxChannel => {
         if (state.reset || closed)
           return Promise.reject(new Error("stream is closed"));
         if (bytes.byteLength === 0) return Promise.resolve();
+        // Fast path: when nothing is queued, send from the caller's buffer and
+        // only copy a remainder if credit runs out mid-write.
+        if (state.pending.length === 0) {
+          let offset = 0;
+          while (
+            !closed &&
+            !state.reset &&
+            state.sendCredit > 0 &&
+            offset < bytes.byteLength
+          ) {
+            const size = Math.min(
+              bytes.byteLength - offset,
+              state.sendCredit,
+              maxPayloadBytes,
+            );
+            if (size <= 0) break;
+            send(
+              FRAME_TYPE.data,
+              state.id,
+              bytes.subarray(offset, offset + size),
+            );
+            offset += size;
+            state.sendCredit -= size;
+          }
+          if (offset === bytes.byteLength) return Promise.resolve();
+          const queued = new Uint8Array(bytes.subarray(offset));
+          return new Promise<void>((resolve, reject) => {
+            state.pending.push({ bytes: queued, offset: 0, resolve, reject });
+            drain(state);
+          });
+        }
         const queued = new Uint8Array(bytes);
         return new Promise<void>((resolve, reject) => {
           state.pending.push({ bytes: queued, offset: 0, resolve, reject });
@@ -347,6 +393,7 @@ export const createChannel = (options: TCreateChannelOptions): TMuxChannel => {
     const stream = makeStream(state);
     streams.set(id, state);
     send(FRAME_TYPE.open, id, openPayload);
+    grantWindowBoost(id);
     return stream;
   };
 
@@ -378,6 +425,7 @@ export const createChannel = (options: TCreateChannelOptions): TMuxChannel => {
       const stream = makeStream(state);
       peerOpenStreams += 1;
       streams.set(frame.streamId, state);
+      grantWindowBoost(frame.streamId);
       emit(streamHandlers, (handler) => handler(stream, frame.payload));
       return;
     }
