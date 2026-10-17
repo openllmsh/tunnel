@@ -310,27 +310,38 @@ export const createChannel = (options: TCreateChannelOptions): TMuxChannel => {
         // only copy a remainder if credit runs out mid-write.
         if (state.pending.length === 0) {
           let offset = 0;
-          while (
-            !closed &&
-            !state.reset &&
-            state.sendCredit > 0 &&
-            offset < bytes.byteLength
-          ) {
-            const size = Math.min(
-              bytes.byteLength - offset,
-              state.sendCredit,
-              maxPayloadBytes,
+          try {
+            while (
+              !closed &&
+              !state.reset &&
+              state.sendCredit > 0 &&
+              offset < bytes.byteLength
+            ) {
+              const size = Math.min(
+                bytes.byteLength - offset,
+                state.sendCredit,
+                maxPayloadBytes,
+              );
+              if (size <= 0) break;
+              send(
+                FRAME_TYPE.data,
+                state.id,
+                bytes.subarray(offset, offset + size),
+              );
+              offset += size;
+              state.sendCredit -= size;
+            }
+          } catch (error) {
+            return Promise.reject(
+              error instanceof Error ? error : new Error(String(error)),
             );
-            if (size <= 0) break;
-            send(
-              FRAME_TYPE.data,
-              state.id,
-              bytes.subarray(offset, offset + size),
-            );
-            offset += size;
-            state.sendCredit -= size;
           }
           if (offset === bytes.byteLength) return Promise.resolve();
+          // send() may have closed/reset mid-loop (e.g. duplex side-effect).
+          // Do not enqueue onto a pending queue localReset already drained.
+          if (state.reset || closed) {
+            return Promise.reject(new Error("stream is closed"));
+          }
           const queued = new Uint8Array(bytes.subarray(offset));
           return new Promise<void>((resolve, reject) => {
             state.pending.push({ bytes: queued, offset: 0, resolve, reject });
