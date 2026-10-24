@@ -1183,8 +1183,27 @@ export const agentStream = (
       offPrepareReset();
       // Caller abort / timeout wins over any RESET captured during prepare —
       // secureMuxStream may locally RESET on abort, and that must not replace
-      // AbortError with unknownReset(local payload).
+      // AbortError with unknownReset(local payload). Still RESET the raw
+      // stream so a custom prepareStream that rejected without resetting
+      // does not leak the OPEN on the peer.
       if (options.signal?.aborted === true) {
+        try {
+          resettingLocally = true;
+          rawStream.reset(
+            streamReset(
+              isTimeoutAbortReason(options.signal.reason)
+                ? "timeout"
+                : "peer_gone",
+              isTimeoutAbortReason(options.signal.reason)
+                ? "agent session open timed out"
+                : "aborted",
+            ),
+          );
+        } catch {
+          // already closed
+        } finally {
+          resettingLocally = false;
+        }
         if (isTimeoutAbortReason(options.signal.reason)) {
           finish("timeout");
           return Promise.reject(
