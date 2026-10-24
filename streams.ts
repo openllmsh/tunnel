@@ -1,12 +1,13 @@
 import type {
-  TDeviceSessionCli,
+  TAgentCommand,
+  TAgentEvent,
+  TAgentStreamOpenPayload,
   TRealtimeClientEvent,
   TRealtimeModel,
   TRealtimeProvider,
   TRealtimeServerEvent,
   TRealtimeStreamOpenPayload,
   TRealtimeVoice,
-  TSessionStreamOpenPayload,
   TStreamResetCode,
   TTunnelForwardHeaders,
   TTunnelResponseHeaders,
@@ -14,9 +15,15 @@ import type {
   TTunnelSurface,
 } from "@openllmsh/protocol";
 import {
+  AGENT_MAX_LINE_BYTES,
   applyTunnelResponseHeadersToHttp,
+  createAgentLineSplitter,
+  decodeAgentLine,
   decodeRealtimeLine,
+  encodeAgentLine,
   encodeRealtimeEventLine,
+  parseAgentCommand,
+  parseAgentEvent,
   parseRealtimeServerEvent,
   parseStreamCtrlPayload,
   parseStreamOpenPayload,
@@ -24,8 +31,11 @@ import {
   REALTIME_HEARTBEAT_INTERVAL_MS,
   REALTIME_HEARTBEAT_TIMEOUT_MS,
   REALTIME_SESSION_MAX_LIFETIME_MS,
+  RETIRED_STREAM_KIND_RESET,
+  RETIRED_STREAM_KINDS,
   StreamResetCode,
   splitRealtimeLines,
+  streamOpenKindOf,
   TUNNEL_MEDIA_MAX_BODY_BYTES,
 } from "@openllmsh/protocol";
 import { Schema } from "effect";
@@ -35,7 +45,26 @@ import {
   MAX_PAYLOAD_BYTES,
 } from "./codec";
 import type { TMuxChannel, TMuxStream } from "./mux";
+import type { TNoiseStaticKey } from "./secure";
+import { secureMuxStream } from "./secure";
 import { StreamResetError } from "./stream-reset-error";
+
+/** Domain prefix of the Noise prologue for an agent stream on the relay mux. */
+export const AGENT_SECURE_PROLOGUE_INFO = "openllm-agent-secure-v1";
+
+/**
+ * Noise prologue for one relay-mux agent stream:
+ * UTF-8 `openllm-agent-secure-v1|<channel_id>|<stream_id>`. Both ends must
+ * use the same value (browser initiator + daemon responder), so a relay
+ * cannot move a handshake onto another channel or stream.
+ */
+export const agentSecurePrologue = (
+  channelId: string,
+  streamId: number,
+): Uint8Array =>
+  new TextEncoder().encode(
+    `${AGENT_SECURE_PROLOGUE_INFO}|${channelId}|${streamId}`,
+  );
 
 /** Default wait for the serving end's `res_head` CTRL (matches legacy tunnel). */
 export const TUNNEL_RESPONSE_HEAD_TIMEOUT_MS = 120_000;
@@ -410,181 +439,6 @@ export const tunnelStream = (
     void pumpBody(stream, options.body, options.signal);
   });
 
-export type TSessionStreamOptions = {
-  readonly sessionId: string;
-  readonly cli: TDeviceSessionCli;
-  readonly cols: number;
-  readonly rows: number;
-  readonly mode: "spawn" | "attach" | "continue";
-  readonly title?: string;
-  /** Maps to `openllm -d <client>` for CLIs that support skip-approvals. */
-  readonly dangerous?: boolean;
-  /** Vendor session id for cold resume (`spawn` only). */
-  readonly resumeSessionId?: string;
-  /** Absolute cwd for spawn/continue; daemon-validated. Omitted → `$HOME`. */
-  readonly cwd?: string;
-  /**
-   * Abort cancels an in-flight open (RESET + reject) so callers can time out
-   * without leaving a dangling mux stream that later races a retry.
-   */
-  readonly signal?: AbortSignal;
-};
-
-export type TSessionCloseResult = TStreamResetCode | "done" | "detach";
-export type TSessionStreamResult = {
-  readonly live: boolean;
-  readonly stdout: ReadableStream<Uint8Array>;
-  readonly write: (bytes: Uint8Array) => Promise<void>;
-  readonly resize: (cols: number, rows: number) => void;
-  /** Claim primary (active-viewer) status without typing. Skew-safe. */
-  readonly focus: () => void;
-  readonly detach: () => void;
-  readonly kill: () => void;
-  readonly onReplayDone: (callback: () => void) => () => void;
-  readonly closed: Promise<TSessionCloseResult>;
-};
-
-/**
- * Open a long-lived PTY session stream over a mux channel. Resolves once the
- * serving daemon acks (`open_ack`); rejects with the nack code/message when
- * the open is refused (`cli_not_installed`, `session_busy`, …).
- */
-export const sessionStream = (
-  channel: TMuxChannel,
-  options: TSessionStreamOptions,
-): Promise<TSessionStreamResult> => {
-  const stream = channel.openStream(
-    encodeJsonPayload({
-      kind: "session",
-      session_id: options.sessionId,
-      cli: options.cli,
-      cols: options.cols,
-      rows: options.rows,
-      mode: options.mode,
-      ...(options.title === undefined ? {} : { title: options.title }),
-      ...(options.dangerous === true ? { dangerous: true } : {}),
-      ...(options.resumeSessionId === undefined
-        ? {}
-        : { resume_session_id: options.resumeSessionId }),
-      ...(options.cwd === undefined ? {} : { cwd: options.cwd }),
-    }),
-  );
-  const replayHandlers = new Set<() => void>();
-  // replay_done can arrive in the same delivery batch as open_ack — before the
-  // caller has had a microtask to register a listener. Latch it so a late
-  // registration still observes the marker exactly once.
-  let replayDoneSeen = false;
-  let resolveClosed: (result: TSessionCloseResult) => void = () => {};
-  const closed = new Promise<TSessionCloseResult>((resolve) => {
-    resolveClosed = resolve;
-  });
-  let closedResult = false;
-  const finish = (result: TSessionCloseResult): void => {
-    if (closedResult) return;
-    closedResult = true;
-    resolveClosed(result);
-  };
-
-  return new Promise<TSessionStreamResult>((resolve, reject) => {
-    let settled = false;
-    const settleReject = (error: Error): void => {
-      if (settled) return;
-      settled = true;
-      options.signal?.removeEventListener("abort", onAbort);
-      reject(error);
-    };
-    const onAbort = (): void => {
-      // Pre-ack abort: RESET so the daemon detaches and a retry can re-open
-      // the same session id without session_busy from a dangling stream.
-      stream.reset(streamReset("timeout", "session open timed out"));
-      finish("timeout");
-      settleReject(new StreamResetError("timeout", "session open timed out"));
-    };
-    const offReset = stream.onReset((payload) => {
-      const code = resetCode(payload) ?? "peer_gone";
-      finish(code);
-      settleReject(unknownReset(payload));
-    });
-    const offEnd = stream.onEnd(() => finish("done"));
-    const _offCtrl = stream.onCtrl((payload) => {
-      const ctrl = parseStreamCtrlPayload(decodeJsonPayload(payload));
-      if (ctrl === null) return;
-      if (ctrl.t === "replay_done") {
-        if (replayDoneSeen) return;
-        replayDoneSeen = true;
-        for (const handler of replayHandlers) handler();
-        return;
-      }
-      if (ctrl.t !== "open_ack" || settled) return;
-      if (!ctrl.ok) {
-        // Prefer the nack code/message when present so the UI can show
-        // cli_not_installed / session_busy / overloaded / etc. instead of a
-        // generic "session refused".
-        const detail =
-          (typeof ctrl.message === "string" && ctrl.message.length > 0
-            ? ctrl.message
-            : undefined) ??
-          (typeof ctrl.error === "string" && ctrl.error.length > 0
-            ? ctrl.error
-            : undefined) ??
-          "session refused";
-        const nackCode = isStreamResetCode(ctrl.error)
-          ? ctrl.error
-          : "protocol_error";
-        // Settle first so the local onReset from stream.reset() cannot replace
-        // the daemon's typed nack code with the wire-close protocol_error.
-        settleReject(new StreamResetError(nackCode, detail));
-        stream.reset(streamReset("protocol_error", detail));
-        // Settle `closed` so callers waiting on it don't hang after a nack.
-        finish("protocol_error");
-        return;
-      }
-      settled = true;
-      options.signal?.removeEventListener("abort", onAbort);
-      resolve({
-        live: ctrl.live ?? false,
-        stdout: bodyFromStream(stream),
-        write: stream.write,
-        resize: (cols, rows) =>
-          stream.sendCtrl(encodeJsonPayload({ t: "resize", cols, rows })),
-        focus: () => stream.sendCtrl(encodeJsonPayload({ t: "focus" })),
-        detach: () => {
-          stream.end();
-          finish("detach");
-        },
-        kill: () => {
-          stream.sendCtrl(encodeJsonPayload({ t: "close", intent: "kill" }));
-          stream.end();
-          // Settle `closed` locally so a caller awaiting it never hangs if the
-          // daemon never sends a terminal END. `finish` is idempotent, so the
-          // daemon's own END (→ "done") later is harmless.
-          finish("done");
-        },
-        onReplayDone: (callback) => {
-          if (replayDoneSeen) {
-            callback();
-            return () => {};
-          }
-          replayHandlers.add(callback);
-          return () => {
-            replayHandlers.delete(callback);
-          };
-        },
-        closed,
-      });
-    });
-    if (options.signal?.aborted) {
-      onAbort();
-    } else {
-      options.signal?.addEventListener("abort", onAbort, { once: true });
-    }
-    // Keep reset/end subscriptions live after open; only the open-ack listener is one-shot.
-    void offReset;
-    void offEnd;
-    void _offCtrl;
-  });
-};
-
 /**
  * Wrap a mux stream's DATA channel as an NDJSON realtime-event pump: each
  * inbound chunk is split on `\n` (carrying a remainder across calls), every
@@ -882,6 +736,430 @@ export const realtimeStream = (
   });
 };
 
+/** Default wait for the serving daemon's agent `open_ack`. */
+export const AGENT_OPEN_TIMEOUT_MS = 30_000;
+
+/** Consumer liveness heartbeat cadence on an open agent stream. */
+export const AGENT_HEARTBEAT_INTERVAL_MS = 15_000;
+
+/** Events held for a consumer that has not subscribed yet (then `lagging`). */
+export const AGENT_MAX_BUFFERED_EVENTS = 1024;
+
+/**
+ * Feed a mux stream's DATA as agent NDJSON lines: split (bounded by
+ * {@link AGENT_MAX_LINE_BYTES}), decode, `parse`, dispatch. Receive credit is
+ * replenished immediately — lines are consumed synchronously here. Shared by
+ * the consumer ({@link agentStream}) and serving ({@link pumpAgentCommands})
+ * sides so both get identical framing.
+ */
+const pumpAgentLines = <T>(
+  stream: TMuxStream,
+  parse: (value: unknown) => T | null,
+  handlers: {
+    readonly onValue: (value: T) => void;
+    readonly onInvalid?: (value: unknown) => void;
+    readonly onOverflow: () => void;
+  },
+): (() => void) => {
+  const splitter = createAgentLineSplitter(AGENT_MAX_LINE_BYTES);
+  return stream.onData((bytes) => {
+    const lines = splitter.push(bytes);
+    stream.consume(bytes.byteLength);
+    if (lines === null) {
+      handlers.onOverflow();
+      return false;
+    }
+    for (const line of lines) {
+      if (line.byteLength === 0) continue;
+      const decoded = decodeAgentLine(line);
+      const value = decoded === undefined ? null : parse(decoded);
+      if (value === null) handlers.onInvalid?.(decoded);
+      else handlers.onValue(value);
+    }
+    return false;
+  });
+};
+
+/** Write one NDJSON line; false when it does not encode/fit or the write fails. */
+const writeAgentLine = async (
+  stream: TMuxStream,
+  value: unknown,
+): Promise<boolean> => {
+  const line = encodeAgentLine(value);
+  if (line === null) return false;
+  try {
+    // The mux splits a write into frames under its negotiated payload cap.
+    await stream.write(line);
+    return true;
+  } catch {
+    return false;
+  }
+};
+
+/** Serving side: acknowledge an admitted agent OPEN. */
+export const acceptAgentStream = (stream: TMuxStream): void => {
+  stream.sendCtrl(encodeJsonPayload({ t: "open_ack", ok: true }));
+};
+
+/**
+ * Serving side: dispatch each valid command line to `onCommand`. A line that
+ * is not a valid {@link TAgentCommand} goes to `onInvalid` (answer with a
+ * `runtime.error`); an over-long line RESETs `protocol_error`.
+ */
+export const pumpAgentCommands = (
+  stream: TMuxStream,
+  onCommand: (command: TAgentCommand) => void,
+  onInvalid?: (value: unknown) => void,
+): (() => void) =>
+  pumpAgentLines(stream, parseAgentCommand, {
+    onValue: onCommand,
+    ...(onInvalid === undefined ? {} : { onInvalid }),
+    onOverflow: () =>
+      stream.reset(streamReset("protocol_error", "agent command too large")),
+  });
+
+/**
+ * Serving side: write one event line. Resolves false when the event does not
+ * fit one line (truncate tool output and retry) or the stream is gone.
+ * Awaiting it applies mux backpressure to the engine adapter.
+ */
+export const sendAgentEvent = (
+  stream: TMuxStream,
+  event: TAgentEvent,
+): Promise<boolean> => writeAgentLine(stream, event);
+
+/**
+ * Initiator-side Noise_IK wrap for a relay-mux agent stream. Prefer this over
+ * a hand-rolled {@link TAgentStreamOptions.prepareStream} when the caller
+ * already has `remoteStatic` (`dpk`), the matching {@link agentSecurePrologue},
+ * and a fresh grant as `payload`. The RTC rung leaves this unset (DTLS is
+ * already E2E).
+ */
+export type TAgentStreamSecureOptions = {
+  /** Responder static key (`dpk`): raw 32 bytes or SPKI DER base64. */
+  readonly remoteStatic: Uint8Array | string;
+  /** Must equal {@link agentSecurePrologue}(channelId, stream.id). */
+  readonly prologue: Uint8Array;
+  /** Message-1 payload — a fresh device grant (UTF-8 envelope). */
+  readonly payload?: Uint8Array;
+  /** Defaults to a fresh per-session key. */
+  readonly localStatic?: TNoiseStaticKey;
+};
+
+export type TAgentStreamOptions = {
+  readonly signal?: AbortSignal;
+  /** Max wait for `open_ack`; defaults to {@link AGENT_OPEN_TIMEOUT_MS}. */
+  readonly headTimeoutMs?: number;
+  /** CTRL heartbeat cadence; `0` disables. Defaults to {@link AGENT_HEARTBEAT_INTERVAL_MS}. */
+  readonly heartbeatIntervalMs?: number;
+  /** RESET `timeout` after this long with no inbound traffic. Off when omitted:
+   *  an agent session may idle for hours waiting on the user. */
+  readonly heartbeatTimeoutMs?: number;
+  /** Defaults to {@link AGENT_MAX_BUFFERED_EVENTS}. */
+  readonly maxBufferedEvents?: number;
+  /**
+   * Optional wrapper run after OPEN is sent and before waiting for `open_ack`.
+   * The relay-mux agent path uses this (or {@link secure}) to run Noise_IK
+   * (initiator) so DATA/CTRL are E2E-encrypted; the RTC rung leaves it unset
+   * (DTLS is already E2E). Must subscribe to the stream synchronously before
+   * any `await`. Wins over {@link secure} when both are set.
+   */
+  readonly prepareStream?: (stream: TMuxStream) => Promise<TMuxStream>;
+  /**
+   * Convenience Noise_IK initiator wrap. Equivalent to a `prepareStream` that
+   * calls {@link secureMuxStream} with `role:"initiator"`. Ignored when
+   * {@link prepareStream} is also set.
+   */
+  readonly secure?: TAgentStreamSecureOptions;
+};
+
+export type TAgentCloseResult = TStreamResetCode | "done" | "detach";
+
+export type TAgentStreamResult = {
+  /** Write one command line. Rejects when it does not fit a line or the
+   *  stream is gone. */
+  readonly send: (command: TAgentCommand) => Promise<void>;
+  /** Subscribe to events. The FIRST subscriber also receives every event
+   *  that arrived before it registered (e.g. right after `open_ack`). */
+  readonly onEvent: (handler: (event: TAgentEvent) => void) => () => void;
+  /** Fires once when an attach replay finishes (`replay_done` CTRL). Latched. */
+  readonly onReplayDone: (callback: () => void) => () => void;
+  /** End the stream, leaving the engine session running for a later attach. */
+  readonly detach: () => void;
+  /** Send `close` (end the engine session), then end the stream. */
+  readonly close: () => void;
+  readonly closed: Promise<TAgentCloseResult>;
+};
+
+/**
+ * Open a `kind:"agent"` stream over a mux channel (browser consumer side) —
+ * RTC first, relay mux fallback, same helper either way. Resolves once the
+ * serving daemon acks (`open_ack`); rejects with the RESET / nack code
+ * (`unauthorized` for a channel without a device grant, `agent_unavailable`,
+ * `agent_busy`, `pty_unsupported` never applies here).
+ *
+ * Commands and events ride NDJSON lines over the flow-controlled DATA channel.
+ * Callers MUST check `hasAgentCap` on the peer's caps before calling this —
+ * an old daemon resets an unknown kind as an invalid OPEN.
+ */
+export const agentStream = (
+  channel: TMuxChannel,
+  options: TAgentStreamOptions = {},
+): Promise<TAgentStreamResult> => {
+  const rawStream = channel.openStream(encodeJsonPayload({ kind: "agent" }));
+  const headTimeoutMs = options.headTimeoutMs ?? AGENT_OPEN_TIMEOUT_MS;
+  const heartbeatIntervalMs =
+    options.heartbeatIntervalMs ?? AGENT_HEARTBEAT_INTERVAL_MS;
+  const maxBufferedEvents =
+    options.maxBufferedEvents ?? AGENT_MAX_BUFFERED_EVENTS;
+
+  const eventHandlers = new Set<(event: TAgentEvent) => void>();
+  const buffered: TAgentEvent[] = [];
+  const replayHandlers = new Set<() => void>();
+  let replayDoneSeen = false;
+
+  let resolveClosed: (result: TAgentCloseResult) => void = () => {};
+  const closed = new Promise<TAgentCloseResult>((resolve) => {
+    resolveClosed = resolve;
+  });
+  let closedResult = false;
+  let heartbeatTimer: ReturnType<typeof setInterval> | undefined;
+  let lastInboundAt = Date.now();
+  const stopTimers = (): void => {
+    if (heartbeatTimer !== undefined) clearInterval(heartbeatTimer);
+    heartbeatTimer = undefined;
+  };
+  const finish = (result: TAgentCloseResult): void => {
+    stopTimers();
+    if (closedResult) return;
+    closedResult = true;
+    resolveClosed(result);
+  };
+
+  const bindAgentStream = (
+    stream: TMuxStream,
+    resolve: (result: TAgentStreamResult) => void,
+    reject: (error: Error) => void,
+  ): void => {
+    const deliver = (event: TAgentEvent): void => {
+      lastInboundAt = Date.now();
+      if (eventHandlers.size === 0) {
+        if (buffered.length >= maxBufferedEvents) {
+          stream.reset(streamReset("lagging", "agent events not consumed"));
+          finish("lagging");
+          return;
+        }
+        buffered.push(event);
+        return;
+      }
+      for (const handler of eventHandlers) handler(event);
+    };
+
+    let settled = false;
+    const settleReject = (error: Error): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(headTimer);
+      options.signal?.removeEventListener("abort", onAbort);
+      reject(error);
+    };
+    const onAbort = (): void => {
+      // Settle first: the local onReset from stream.reset() must not replace
+      // the AbortError / timeout rejection with unknownReset(payload).
+      if (isTimeoutAbortReason(options.signal?.reason)) {
+        finish("timeout");
+        settleReject(
+          new StreamResetError("timeout", "agent session open timed out"),
+        );
+        stream.reset(streamReset("timeout", "agent session open timed out"));
+        return;
+      }
+      finish("timeout");
+      settleReject(callerAbortError(options.signal));
+      stream.reset(streamReset("timeout", "agent session aborted by caller"));
+    };
+    const headTimer = setTimeout(() => {
+      finish("timeout");
+      settleReject(
+        new StreamResetError("timeout", "agent session open timed out"),
+      );
+      stream.reset(streamReset("timeout", "agent session open timed out"));
+    }, headTimeoutMs);
+
+    const offReset = stream.onReset((payload) => {
+      finish(resetCode(payload) ?? "peer_gone");
+      settleReject(unknownReset(payload));
+    });
+    const offEnd = stream.onEnd(() => {
+      finish("done");
+      settleReject(
+        new StreamResetError("peer_gone", "stream ended before open_ack"),
+      );
+    });
+    const offData = pumpAgentLines(stream, parseAgentEvent, {
+      onValue: deliver,
+      // Unknown (newer) event types are dropped, but still count as traffic.
+      onInvalid: () => {
+        lastInboundAt = Date.now();
+      },
+      onOverflow: () => {
+        stream.reset(streamReset("lagging", "agent event line too large"));
+        finish("lagging");
+      },
+    });
+    const offCtrl = stream.onCtrl((payload) => {
+      lastInboundAt = Date.now();
+      const ctrl = parseStreamCtrlPayload(decodeJsonPayload(payload));
+      if (ctrl === null) return;
+      if (ctrl.t === "replay_done") {
+        if (replayDoneSeen) return;
+        replayDoneSeen = true;
+        for (const handler of replayHandlers) handler();
+        return;
+      }
+      if (ctrl.t !== "open_ack" || settled) return;
+      if (!ctrl.ok) {
+        const detail =
+          (typeof ctrl.message === "string" && ctrl.message.length > 0
+            ? ctrl.message
+            : undefined) ??
+          (typeof ctrl.error === "string" && ctrl.error.length > 0
+            ? ctrl.error
+            : undefined) ??
+          "agent session refused";
+        const nackCode = isStreamResetCode(ctrl.error)
+          ? ctrl.error
+          : "protocol_error";
+        settleReject(new StreamResetError(nackCode, detail));
+        stream.reset(streamReset("protocol_error", detail));
+        finish(nackCode);
+        return;
+      }
+      settled = true;
+      clearTimeout(headTimer);
+      options.signal?.removeEventListener("abort", onAbort);
+      if (heartbeatIntervalMs > 0) {
+        heartbeatTimer = setInterval(() => {
+          const timeoutMs = options.heartbeatTimeoutMs;
+          if (
+            timeoutMs !== undefined &&
+            Date.now() - lastInboundAt > timeoutMs
+          ) {
+            stream.reset(streamReset("timeout", "agent heartbeat timed out"));
+            finish("timeout");
+            return;
+          }
+          stream.sendCtrl(encodeJsonPayload({ t: "heartbeat" }));
+        }, heartbeatIntervalMs);
+      }
+      resolve({
+        send: async (command) => {
+          if (closedResult) throw new Error("agent stream closed");
+          if (!(await writeAgentLine(stream, command))) {
+            throw new Error("agent command not sent");
+          }
+        },
+        onEvent: (handler) => {
+          const first = eventHandlers.size === 0;
+          eventHandlers.add(handler);
+          if (first && buffered.length > 0) {
+            for (const event of buffered.splice(0)) handler(event);
+          }
+          return () => {
+            eventHandlers.delete(handler);
+          };
+        },
+        onReplayDone: (callback) => {
+          if (replayDoneSeen) {
+            callback();
+            return () => {};
+          }
+          replayHandlers.add(callback);
+          return () => {
+            replayHandlers.delete(callback);
+          };
+        },
+        detach: () => {
+          stream.end();
+          finish("detach");
+        },
+        close: () => {
+          void writeAgentLine(stream, { type: "close" }).finally(() => {
+            stream.end();
+          });
+          finish("done");
+        },
+        closed,
+      });
+    });
+    if (options.signal?.aborted) {
+      onAbort();
+    } else {
+      options.signal?.addEventListener("abort", onAbort, { once: true });
+    }
+    void offReset;
+    void offEnd;
+    void offData;
+    void offCtrl;
+  };
+
+  const prepareStream =
+    options.prepareStream ??
+    (options.secure === undefined
+      ? undefined
+      : (stream: TMuxStream): Promise<TMuxStream> => {
+          const secure = options.secure;
+          if (secure === undefined) {
+            return Promise.resolve(stream);
+          }
+          return secureMuxStream(stream, {
+            role: "initiator",
+            remoteStatic: secure.remoteStatic,
+            prologue: secure.prologue,
+            ...(secure.payload === undefined
+              ? {}
+              : { payload: secure.payload }),
+            ...(secure.localStatic === undefined
+              ? {}
+              : { localStatic: secure.localStatic }),
+            ...(options.signal === undefined ? {} : { signal: options.signal }),
+          });
+        });
+
+  if (prepareStream === undefined) {
+    return new Promise<TAgentStreamResult>((resolve, reject) => {
+      bindAgentStream(rawStream, resolve, reject);
+    });
+  }
+
+  return prepareStream(rawStream)
+    .then(
+      (prepared) =>
+        new Promise<TAgentStreamResult>((resolve, reject) => {
+          bindAgentStream(prepared, resolve, reject);
+        }),
+    )
+    .catch((err: unknown) => {
+      // Handshake / wrap failed — RESET the raw stream so the peer tears down.
+      try {
+        rawStream.reset(
+          streamReset(
+            "unauthorized",
+            err instanceof Error ? err.message : "secure handshake failed",
+          ),
+        );
+      } catch {
+        // already closed
+      }
+      finish("unauthorized");
+      return Promise.reject(
+        err instanceof Error
+          ? err
+          : new StreamResetError("unauthorized", "secure handshake failed"),
+      );
+    });
+};
+
 export type TServeTunnelResponse = {
   readonly status: number;
   readonly headers?: TTunnelResponseHeaders;
@@ -896,15 +1174,20 @@ export type TServeTunnel = (
   signal: AbortSignal,
 ) => Promise<TServeTunnelResponse>;
 
-export type TServeSession = (
+/** Serving-side `kind:"agent"` dispatch — given the raw stream, the handler
+ *  owns admission (nack via `stream.reset`), the `open_ack` CTRL
+ *  ({@link acceptAgentStream}), and the NDJSON exchange
+ *  ({@link pumpAgentCommands} / {@link sendAgentEvent}). The seed gate runs
+ *  BEFORE this is reached (daemon mux-host / RTC offer). */
+export type TServeAgent = (
   stream: TMuxStream,
-  open: TSessionStreamOpenPayload,
+  open: TAgentStreamOpenPayload,
 ) => void | Promise<void>;
 
 /** Serving-side `kind:"realtime"` dispatch — given the raw stream, the
  *  handler owns admission (nack via `stream.reset`), the `open_ack` CTRL,
  *  and pumping events both ways (typically via `pumpRealtimeEvents` /
- *  `sendRealtimeEvent`). Mirrors `TServeSession`'s shape: unlike
+ *  `sendRealtimeEvent`). Mirrors `TServeAgent`'s shape: unlike
  *  `TServeTunnel` (one request/response), a realtime session is long-lived
  *  and duplex. */
 export type TServeRealtime = (
@@ -914,7 +1197,8 @@ export type TServeRealtime = (
 
 export type TServeStreamsOptions = {
   readonly tunnel: TServeTunnel;
-  readonly session?: TServeSession;
+  /** Absent → a `kind:"agent"` OPEN resets `agent_unavailable`. */
+  readonly agent?: TServeAgent;
   readonly realtime?: TServeRealtime;
   /** Reject a valid tunnel OPEN before dispatch, using host-specific wire semantics. */
   readonly admitTunnel?: (
@@ -988,7 +1272,20 @@ export const serveStream =
     options: TServeStreamsOptions,
   ): ((stream: TMuxStream, payload: Uint8Array) => void) =>
   (stream, payload) => {
-    const open = parseStreamOpenPayload(decodeJsonPayload(payload));
+    const decoded = decodeJsonPayload(payload);
+    const rawKind = streamOpenKindOf(decoded);
+    if (rawKind !== null && RETIRED_STREAM_KINDS.has(rawKind)) {
+      // A pre-agent browser still opening PTY `kind:"session"`: a clear,
+      // decodable code instead of a generic invalid-OPEN.
+      stream.reset(
+        streamReset(
+          RETIRED_STREAM_KIND_RESET.code,
+          RETIRED_STREAM_KIND_RESET.message,
+        ),
+      );
+      return;
+    }
+    const open = parseStreamOpenPayload(decoded);
     if (open === null) {
       stream.reset(
         streamReset(
@@ -998,14 +1295,14 @@ export const serveStream =
       );
       return;
     }
-    if (open.kind === "session") {
-      if (options.session === undefined) {
-        stream.reset(streamReset("pty_unsupported"));
+    if (open.kind === "agent") {
+      if (options.agent === undefined) {
+        stream.reset(streamReset("agent_unavailable"));
         return;
       }
       // Defer invoke so both sync throws and rejected promises hit the same
       // catch (Promise.resolve(fn()) does not catch sync throws from fn).
-      const dispatch = options.session;
+      const dispatch = options.agent;
       void (async () => dispatch(stream, open))().catch(() => {
         stream.reset(streamReset("dispatch_failed"));
       });

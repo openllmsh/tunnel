@@ -60,8 +60,11 @@ enveloped (no relay hop — the data channel itself is the channel).
 **Landed on this branch (beyond the frozen mux core):**
 
 - `device-grant.ts` — seed-gated device-access grant wire format (signed by the
-  browser vault; verified by the daemon). Capability negotiation uses
-  `seedgate1` from `@openllmsh/protocol`.
+  browser with the phrase-derived device-control key; verified by the daemon).
+  Capability negotiation uses `seedgate1` from `@openllmsh/protocol`.
+- `device-control.ts` — device-control rotation v2 wire format
+  (`label || 0x00 || {v:2, old, new, cv}`, no timestamp, signed by `old`) and
+  the shared key fingerprint (`keyFingerprint` / `formatKeyFingerprint`).
 - `rtc-auth.ts` / `rtc-duplex.ts` / `rtc-ice.ts` — WebRTC fingerprint-bound
   offer/answer shapes, ICE-server and SCTP payload-cap helpers, a thin
   data-channel duplex, and daemon-side mDNS-candidate preflight for werift.
@@ -71,10 +74,20 @@ enveloped (no relay hop — the data channel itself is the channel).
   binary mux is the fallback rung when RTC is unavailable (consumers do not use
   a JSON splice — see `@packages/daemon-relay/ARCHITECTURE.md`).
 
-**Still future (not present in this package):**
+**P2: agent-sessions E2E (in this release):**
 
-- `secure.ts` — Noise_IK duplex wrapper (P2). Noise wraps complete mux frames as
-  plaintext messages, so it needs **no reserved mux-header fields**; the frozen
-  nine-byte layout remains unchanged.
+- `secure.ts` — Noise_IK duplex wrapper (P2). Secures the mux fallback for
+  agent streams (browser path when RTC unavailable or forced off).
+  `secureMuxStream` encrypts DATA (length-prefixed Noise records) and CTRL
+  (separate key pair); RESET / END / WINDOW stay plaintext. The frozen
+  nine-byte mux layout is unchanged.
+- `streams.ts` — `agentStream` / `acceptAgentStream` plus the shared
+  `agentSecurePrologue` / `AGENT_SECURE_PROLOGUE_INFO` contract
+  (`openllm-agent-secure-v1|<channel_id>|<stream_id>`). Browser initiator and
+  daemon responder MUST import these from here (not duplicate the string).
+  `agentStream` accepts `secure` (initiator wrap) or a custom `prepareStream`.
+
+**Still future (not present):**
+
 - `paths.ts` — multi-path resolver (loopback → LAN → relay) for later direct-path
   work (P3).

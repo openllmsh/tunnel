@@ -1,11 +1,13 @@
 /**
  * Canonical device-grant wire format shared by the browser (which
- * SIGNS grants with the vault-derived device-access key) and the
- * daemon (which VERIFIES them). Bytes + JSON only — no crypto lives
+ * SIGNS grants with the account device-control key — derived from the
+ * recovery phrase, never the DEK; see `device-control.ts`) and the
+ * daemon (which VERIFIES them against its pinned control pubkey). Bytes + JSON only — no crypto lives
  * here. Wire size cap is owned by protocol and re-exported.
  */
 
 import { DEVICE_GRANT_B64_MAX } from "@openllmsh/protocol";
+import { decodeB64Json, encodeB64Json, labelledMessage } from "./wire-bytes";
 
 export { DEVICE_GRANT_B64_MAX };
 
@@ -26,6 +28,16 @@ export type TDeviceGrantFields = {
   readonly cid: string;
   /** Daemon X25519 pubkey b64 ("" when unknown — legacy tunnel path). */
   readonly aud: string;
+  /**
+   * The daemon X25519 pubkey (SPKI DER, base64) the signer TRUSTS — taken
+   * from a daemon attestation signed by the device-control key
+   * (`@openllm/vault` `daemon-attest.ts`), not from the cloud — and used as
+   * the Noise_IK responder key (`secure.ts`) on the relay mux. The daemon
+   * refuses a grant whose `dpk` is not its own key. Absent on legacy grants;
+   * when absent it is also absent from the signed message, so legacy bytes
+   * are unchanged.
+   */
+  readonly dpk?: string;
 };
 
 export type TDeviceGrantEnvelope = TDeviceGrantFields & {
@@ -37,45 +49,35 @@ export type TDeviceGrantEnvelope = TDeviceGrantFields & {
  *
  * The JSON is canonical-by-construction: it is produced by
  * `JSON.stringify` of an object literal written in the fixed field
- * order `v, n, ts, key_id, cid, aud`. ECMAScript guarantees own
- * string-keyed property enumeration (and therefore stringify output)
- * follows insertion order, so building the literal in that order
- * yields identical bytes for identical fields on every runtime.
+ * order `v, n, ts, key_id, cid, aud[, dpk]` (`dpk` only when present).
+ * ECMAScript guarantees own string-keyed property enumeration (and
+ * therefore stringify output) follows insertion order, so building the
+ * literal in that order yields identical bytes for identical fields on
+ * every runtime.
  */
 export const buildDeviceGrantMessage = (
   fields: TDeviceGrantFields,
-): Uint8Array => {
-  const json = JSON.stringify({
-    v: fields.v,
-    n: fields.n,
-    ts: fields.ts,
-    key_id: fields.key_id,
-    cid: fields.cid,
-    aud: fields.aud,
-  });
-  const label = new TextEncoder().encode(DEVICE_GRANT_LABEL);
-  const body = new TextEncoder().encode(json);
-  const out = new Uint8Array(label.length + 1 + body.length);
-  out.set(label, 0);
-  out[label.length] = 0x00;
-  out.set(body, label.length + 1);
-  return out;
-};
+): Uint8Array =>
+  labelledMessage(
+    DEVICE_GRANT_LABEL,
+    JSON.stringify({
+      v: fields.v,
+      n: fields.n,
+      ts: fields.ts,
+      key_id: fields.key_id,
+      cid: fields.cid,
+      aud: fields.aud,
+      ...(fields.dpk === undefined ? {} : { dpk: fields.dpk }),
+    }),
+  );
 
 /** base64(JSON) envelope encoding for the wire. */
-export const encodeDeviceGrant = (envelope: TDeviceGrantEnvelope): string => {
-  const json = JSON.stringify(envelope);
-  const bytes = new TextEncoder().encode(json);
-  let bin = "";
-  for (let i = 0; i < bytes.length; i++) {
-    bin += String.fromCharCode(bytes[i] as number);
-  }
-  const b64 = btoa(bin);
-  if (b64.length > DEVICE_GRANT_B64_MAX) {
-    throw new RangeError("device grant exceeds DEVICE_GRANT_B64_MAX");
-  }
-  return b64;
-};
+export const encodeDeviceGrant = (envelope: TDeviceGrantEnvelope): string =>
+  encodeB64Json(
+    envelope,
+    DEVICE_GRANT_B64_MAX,
+    "device grant exceeds DEVICE_GRANT_B64_MAX",
+  );
 
 const isNonEmptyString = (value: unknown): value is string => {
   return typeof value === "string" && value.length > 0;
@@ -94,27 +96,14 @@ const isValidNonce = (value: unknown): value is string => {
 
 /**
  * Strict decode: returns null on any shape mismatch. `aud` may be the
- * empty string (legacy tunnel path); every other string field must be
+ * empty string (legacy tunnel path); `dpk` may be absent (legacy grant) but,
+ * when present, must be a non-empty string; every other string field must be
  * non-empty, `v` must be exactly 1, `n` base64 of
  * {@link DEVICE_GRANT_NONCE_BYTES} bytes, and `ts` a finite positive integer.
  */
 export const decodeDeviceGrant = (b64: string): TDeviceGrantEnvelope | null => {
-  if (b64.length > DEVICE_GRANT_B64_MAX) return null;
-  let parsed: unknown;
-  try {
-    const bin = atob(b64);
-    const bytes = new Uint8Array(bin.length);
-    for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-    parsed = JSON.parse(
-      new TextDecoder("utf-8", { fatal: true }).decode(bytes),
-    );
-  } catch {
-    return null;
-  }
-  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
-    return null;
-  }
-  const o = parsed as Record<string, unknown>;
+  const o = decodeB64Json(b64, DEVICE_GRANT_B64_MAX);
+  if (o === null) return null;
   if (o.v !== DEVICE_GRANT_VERSION) return null;
   if (!isValidNonce(o.n)) return null;
   if (
@@ -129,6 +118,10 @@ export const decodeDeviceGrant = (b64: string): TDeviceGrantEnvelope | null => {
   if (!isNonEmptyString(o.cid)) return null;
   if (typeof o.aud !== "string") return null;
   if (!isNonEmptyString(o.sig)) return null;
+  const rawDpk = o.dpk;
+  const dpk: string | undefined | null =
+    rawDpk === undefined ? undefined : isNonEmptyString(rawDpk) ? rawDpk : null;
+  if (dpk === null) return null;
   return {
     v: DEVICE_GRANT_VERSION,
     n: o.n,
@@ -136,6 +129,7 @@ export const decodeDeviceGrant = (b64: string): TDeviceGrantEnvelope | null => {
     key_id: o.key_id,
     cid: o.cid,
     aud: o.aud,
+    ...(dpk === undefined ? {} : { dpk }),
     sig: o.sig,
   };
 };
