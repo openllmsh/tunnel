@@ -1030,9 +1030,11 @@ export const agentStream = (
         const nackCode = isStreamResetCode(ctrl.error)
           ? ctrl.error
           : "protocol_error";
+        // Finish before reset: a synchronous local onReset must not settle
+        // `closed` with the peer-facing protocol_error instead of nackCode.
         settleReject(new StreamResetError(nackCode, detail));
-        stream.reset(streamReset("protocol_error", detail));
         finish(nackCode);
+        stream.reset(streamReset("protocol_error", detail));
         return;
       }
       settled = true;
