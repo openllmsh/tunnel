@@ -1136,14 +1136,43 @@ export const agentStream = (
 
   // Capture a peer RESET that lands during preparation so we surface the
   // peer's code instead of overwriting it with our own unauthorized reset.
+  // Local resets from prepareStream (e.g. secureMuxStream.fail → stream.reset)
+  // must NOT count as peer-originated: wrap `reset` so those are ignored here.
   // bindAgentStream failures must NOT enter this handler (two-arg then), or
   // a post-open nack would trigger a second reset on the already-closed stream.
   let peerResetPayload: Uint8Array | null = null;
+  let resettingLocally = false;
   const offPrepareReset = rawStream.onReset((payload) => {
+    if (resettingLocally) return;
     peerResetPayload = payload;
   });
+  const prepareInput: TMuxStream = {
+    id: rawStream.id,
+    write: (bytes) => rawStream.write(bytes),
+    end: () => {
+      rawStream.end();
+    },
+    reset: (payload) => {
+      resettingLocally = true;
+      try {
+        rawStream.reset(payload);
+      } finally {
+        resettingLocally = false;
+      }
+    },
+    sendCtrl: (payload) => {
+      rawStream.sendCtrl(payload);
+    },
+    consume: (bytes) => {
+      rawStream.consume(bytes);
+    },
+    onData: (handler) => rawStream.onData(handler),
+    onEnd: (handler) => rawStream.onEnd(handler),
+    onReset: (handler) => rawStream.onReset(handler),
+    onCtrl: (handler) => rawStream.onCtrl(handler),
+  };
 
-  return prepareStream(rawStream).then(
+  return prepareStream(prepareInput).then(
     (prepared) => {
       offPrepareReset();
       return new Promise<TAgentStreamResult>((resolve, reject) => {
@@ -1152,6 +1181,19 @@ export const agentStream = (
     },
     (err: unknown) => {
       offPrepareReset();
+      // Caller abort / timeout wins over any RESET captured during prepare —
+      // secureMuxStream may locally RESET on abort, and that must not replace
+      // AbortError with unknownReset(local payload).
+      if (options.signal?.aborted === true) {
+        if (isTimeoutAbortReason(options.signal.reason)) {
+          finish("timeout");
+          return Promise.reject(
+            new StreamResetError("timeout", "agent session open timed out"),
+          );
+        }
+        finish("timeout");
+        return Promise.reject(callerAbortError(options.signal));
+      }
       const peerPayload = peerResetPayload;
       if (peerPayload !== null) {
         const peerErr = unknownReset(peerPayload);
@@ -1161,6 +1203,7 @@ export const agentStream = (
       // Handshake / wrap failed with no peer RESET — RESET the raw stream
       // so the peer tears down.
       try {
+        resettingLocally = true;
         rawStream.reset(
           streamReset(
             "unauthorized",
@@ -1169,6 +1212,8 @@ export const agentStream = (
         );
       } catch {
         // already closed
+      } finally {
+        resettingLocally = false;
       }
       finish("unauthorized");
       return Promise.reject(
