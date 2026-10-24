@@ -1132,15 +1132,32 @@ export const agentStream = (
     });
   }
 
-  return prepareStream(rawStream)
-    .then(
-      (prepared) =>
-        new Promise<TAgentStreamResult>((resolve, reject) => {
-          bindAgentStream(prepared, resolve, reject);
-        }),
-    )
-    .catch((err: unknown) => {
-      // Handshake / wrap failed — RESET the raw stream so the peer tears down.
+  // Capture a peer RESET that lands during preparation so we surface the
+  // peer's code instead of overwriting it with our own unauthorized reset.
+  // bindAgentStream failures must NOT enter this handler (two-arg then), or
+  // a post-open nack would trigger a second reset on the already-closed stream.
+  let peerResetPayload: Uint8Array | null = null;
+  const offPrepareReset = rawStream.onReset((payload) => {
+    peerResetPayload = payload;
+  });
+
+  return prepareStream(rawStream).then(
+    (prepared) => {
+      offPrepareReset();
+      return new Promise<TAgentStreamResult>((resolve, reject) => {
+        bindAgentStream(prepared, resolve, reject);
+      });
+    },
+    (err: unknown) => {
+      offPrepareReset();
+      const peerPayload = peerResetPayload;
+      if (peerPayload !== null) {
+        const peerErr = unknownReset(peerPayload);
+        finish(peerErr.code);
+        return Promise.reject(peerErr);
+      }
+      // Handshake / wrap failed with no peer RESET — RESET the raw stream
+      // so the peer tears down.
       try {
         rawStream.reset(
           streamReset(
@@ -1157,7 +1174,8 @@ export const agentStream = (
           ? err
           : new StreamResetError("unauthorized", "secure handshake failed"),
       );
-    });
+    },
+  );
 };
 
 export type TServeTunnelResponse = {
