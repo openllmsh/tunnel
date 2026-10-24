@@ -1,21 +1,22 @@
 /**
- * Device trust anchor + daemon-key proof + signed device-sessions command —
- * the wire formats only. Bytes + JSON, no crypto: the browser computes with
- * WebCrypto (`@openllm/vault` `device-anchor.ts`), the daemon with
- * node:crypto (`packages/cli/daemon/src/device-anchor.ts`).
+ * Device trust anchor + daemon-key proof — the wire formats only. Bytes +
+ * JSON, no crypto: the browser computes with WebCrypto (`@openllm/vault`
+ * `device-anchor.ts`), the daemon with node:crypto
+ * (`packages/cli/daemon/src/device-anchor.ts`).
  *
  * - **Anchor** = base64url(control pubkey raw 32 || pair_secret 32), where
  *   `pair_secret = HKDF-SHA256(ikm = control seed, salt = utf8(key_id),
  *   info = "openllm-pair-v1", 32)`. It rides the install / setup command as a
  *   suffix of the API key (`sk-llm-<id>.<secret>.<anchor>`) and NEVER leaves
- *   the device: the daemon splits it off and keeps it in `state.json`.
+ *   the device: the daemon splits it off and keeps it in the runtime env file.
  * - **dpk proof** = `HMAC-SHA256(pair_secret, "openllm-dpk-proof-v1" ||
  *   key_id || dpk)`, base64url. The daemon publishes it in its status; any browser
  *   holding the control seed recomputes `pair_secret` and verifies it, so the
  *   daemon's static X25519 key is trusted without a first-use window.
- * - **Device-sessions command** = `{ v, key_id, enable, ts, nonce }` signed by
- *   the control key, delivered over the control channel. The daemon verifies
- *   it against its anchored pin.
+ *
+ * Device sessions on == the anchor is present. Re-enable is install / update /
+ * login / desktop with the sessions toggle on. The only remote control is a
+ * signed **disable** (strips the anchor); a compromised cloud cannot forge it.
  */
 import {
   isOpenllmDeviceAnchorSyntax,
@@ -40,13 +41,6 @@ const ED25519_RAW_BYTES = 32;
 export const DPK_PROOF_LABEL = "openllm-dpk-proof-v1";
 /** base64url of a 32-byte HMAC-SHA256. */
 export const DPK_PROOF_LENGTH = 43;
-
-/** Domain label of the signed device-sessions command. */
-export const DEVICE_SESSIONS_COMMAND_LABEL = "openllm-device-sessions-v1";
-export const DEVICE_SESSIONS_COMMAND_VERSION = 1 as const;
-/** A command older (or further in the future) than this is refused. */
-export const DEVICE_SESSIONS_COMMAND_TS_WINDOW_MS = 5 * 60 * 1000;
-export const DEVICE_SESSIONS_COMMAND_B64_MAX = 1024;
 
 /** DER SPKI prefix of an Ed25519 public key. */
 const ED25519_SPKI_PREFIX = new Uint8Array([
@@ -151,64 +145,68 @@ export const buildDpkProofMessage = (
 export const isDpkProofSyntax = (proof: string): boolean =>
   proof.length === DPK_PROOF_LENGTH && fromB64UrlBytes(proof)?.length === 32;
 
-export type TDeviceSessionsCommandFields = {
+/** Domain label of the signed device-sessions disable. */
+export const DEVICE_SESSIONS_DISABLE_LABEL =
+  "openllm-device-sessions-disable-v1";
+export const DEVICE_SESSIONS_DISABLE_VERSION = 1 as const;
+/** A disable older (or further in the future) than this is refused. */
+export const DEVICE_SESSIONS_DISABLE_TS_WINDOW_MS = 5 * 60 * 1000;
+export const DEVICE_SESSIONS_DISABLE_B64_MAX = 1024;
+
+export type TDeviceSessionsDisableFields = {
   readonly v: 1;
   /** The target daemon's api key id — a command for another key is refused. */
   readonly key_id: string;
-  readonly enable: boolean;
-  /** ms since epoch; must be fresh and greater than the last accepted one. */
+  /** ms since epoch; must be fresh. */
   readonly ts: number;
   /** 16 random bytes, base64url — makes every statement unique. */
   readonly nonce: string;
 };
 
-export type TDeviceSessionsCommandEnvelope = TDeviceSessionsCommandFields & {
+export type TDeviceSessionsDisableEnvelope = TDeviceSessionsDisableFields & {
   /** Ed25519 signature by the control key, base64. */
   readonly sig: string;
 };
 
 /**
  * Canonical signed bytes: `utf8(LABEL) || 0x00 || utf8(json)`, fixed key
- * order `v, key_id, enable, ts, nonce`.
+ * order `v, key_id, ts, nonce`. Disable-only — there is no enable field.
  */
-export const buildDeviceSessionsCommandMessage = (
-  fields: TDeviceSessionsCommandFields,
+export const buildDeviceSessionsDisableMessage = (
+  fields: TDeviceSessionsDisableFields,
 ): Uint8Array =>
   labelledMessage(
-    DEVICE_SESSIONS_COMMAND_LABEL,
+    DEVICE_SESSIONS_DISABLE_LABEL,
     JSON.stringify({
       v: fields.v,
       key_id: fields.key_id,
-      enable: fields.enable,
       ts: fields.ts,
       nonce: fields.nonce,
     }),
   );
 
-export const encodeDeviceSessionsCommand = (
-  envelope: TDeviceSessionsCommandEnvelope,
+export const encodeDeviceSessionsDisable = (
+  envelope: TDeviceSessionsDisableEnvelope,
 ): string =>
   encodeB64Json(
     {
       v: envelope.v,
       key_id: envelope.key_id,
-      enable: envelope.enable,
       ts: envelope.ts,
       nonce: envelope.nonce,
       sig: envelope.sig,
     },
-    DEVICE_SESSIONS_COMMAND_B64_MAX,
-    "device sessions command exceeds its wire cap",
+    DEVICE_SESSIONS_DISABLE_B64_MAX,
+    "device sessions disable exceeds its wire cap",
   );
 
-export const decodeDeviceSessionsCommand = (
+export const decodeDeviceSessionsDisable = (
   b64: string,
-): TDeviceSessionsCommandEnvelope | null => {
-  const o = decodeB64Json(b64, DEVICE_SESSIONS_COMMAND_B64_MAX);
+): TDeviceSessionsDisableEnvelope | null => {
+  const o = decodeB64Json(b64, DEVICE_SESSIONS_DISABLE_B64_MAX);
   if (o === null) return null;
-  if (o.v !== DEVICE_SESSIONS_COMMAND_VERSION) return null;
+  if (o.v !== DEVICE_SESSIONS_DISABLE_VERSION) return null;
   if (typeof o.key_id !== "string" || o.key_id.length === 0) return null;
-  if (typeof o.enable !== "boolean") return null;
   if (
     typeof o.ts !== "number" ||
     !Number.isInteger(o.ts) ||
@@ -219,10 +217,11 @@ export const decodeDeviceSessionsCommand = (
   }
   if (typeof o.nonce !== "string" || o.nonce.length === 0) return null;
   if (typeof o.sig !== "string" || o.sig.length === 0) return null;
+  // Refuse a leftover enable-shaped payload from older clients.
+  if ("enable" in o) return null;
   return {
-    v: DEVICE_SESSIONS_COMMAND_VERSION,
+    v: DEVICE_SESSIONS_DISABLE_VERSION,
     key_id: o.key_id,
-    enable: o.enable,
     ts: o.ts,
     nonce: o.nonce,
     sig: o.sig,
