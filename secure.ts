@@ -736,9 +736,14 @@ export const secureDuplex = async (
   let partial: Uint8Array[] = [];
   let partialBytes = 0;
 
+  const pendingMessages: Array<Uint8Array | null> = [];
   const deliver = (bytes: Uint8Array | null): void => {
+    if (listener === null) {
+      pendingMessages.push(bytes);
+      return;
+    }
     try {
-      listener?.(bytes);
+      listener(bytes);
     } catch {
       // A listener cannot destabilize the carrier.
     }
@@ -859,6 +864,9 @@ export const secureDuplex = async (
     send,
     onBytes: (callback) => {
       listener = callback;
+      if (pendingMessages.length === 0) return;
+      const queued = pendingMessages.splice(0);
+      for (const message of queued) deliver(message);
     },
     close: () => {
       die(false);
@@ -959,6 +967,10 @@ export const secureMuxStream = async (
   const endHandlers = new Set<() => void>();
   const resetHandlers = new Set<TMuxEventHandler>();
   const ctrlHandlers = new Set<TMuxEventHandler>();
+  // Plaintext that lands before the caller has registered a handler (the
+  // await of secureMuxStream returns, then the peer may already have sent).
+  const pendingData: Uint8Array[] = [];
+  const pendingCtrl: Uint8Array[] = [];
   let phase: TSecurePhase = "handshake";
   const currentPhase = (): TSecurePhase => phase;
   let keys: TTransportKeys | null = null;
@@ -976,6 +988,21 @@ export const secureMuxStream = async (
     stream.reset(encodeJsonPayload({ code, message }));
   };
 
+  const emitData = (plaintext: Uint8Array): void => {
+    if (dataHandlers.size === 0) {
+      pendingData.push(plaintext);
+      return;
+    }
+    emitAll(dataHandlers, (handler) => handler(plaintext));
+  };
+  const emitCtrl = (plaintext: Uint8Array): void => {
+    if (ctrlHandlers.size === 0) {
+      pendingCtrl.push(plaintext);
+      return;
+    }
+    emitAll(ctrlHandlers, (handler) => handler(plaintext));
+  };
+
   const receiveRecord = async (record: Uint8Array): Promise<void> => {
     if (phase !== "open" || keys === null) return;
     let plaintext: Uint8Array;
@@ -986,7 +1013,7 @@ export const secureMuxStream = async (
       return;
     }
     if (phase !== "open") return;
-    emitAll(dataHandlers, (handler) => handler(plaintext));
+    emitData(plaintext);
     stream.consume(LENGTH_PREFIX_BYTES + record.byteLength);
   };
 
@@ -1055,7 +1082,7 @@ export const secureMuxStream = async (
         return;
       }
       if (phase !== "open") return;
-      emitAll(ctrlHandlers, (handler) => handler(plaintext));
+      emitCtrl(plaintext);
     });
   };
   // The peer finishes its side first and may send CTRL (e.g. `open_ack`)
@@ -1116,8 +1143,7 @@ export const secureMuxStream = async (
           new Uint8Array(),
           early,
         );
-        if (phase === "open")
-          emitAll(dataHandlers, (handler) => handler(plaintext));
+        if (phase === "open") emitData(plaintext);
       } catch {
         fail("protocol_error", "secure stream integrity failure");
       }
@@ -1186,6 +1212,12 @@ export const secureMuxStream = async (
     consume: () => {},
     onData: (handler) => {
       dataHandlers.add(handler);
+      if (pendingData.length > 0) {
+        const queued = pendingData.splice(0);
+        for (const plaintext of queued) {
+          emitAll(dataHandlers, (h) => h(plaintext));
+        }
+      }
       return () => dataHandlers.delete(handler);
     },
     onEnd: (handler) => {
@@ -1198,6 +1230,12 @@ export const secureMuxStream = async (
     },
     onCtrl: (handler) => {
       ctrlHandlers.add(handler);
+      if (pendingCtrl.length > 0) {
+        const queued = pendingCtrl.splice(0);
+        for (const plaintext of queued) {
+          emitAll(ctrlHandlers, (h) => h(plaintext));
+        }
+      }
       return () => ctrlHandlers.delete(handler);
     },
     remoteStatic: handshake.remoteStatic,
