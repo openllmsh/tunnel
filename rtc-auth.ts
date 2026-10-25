@@ -23,9 +23,11 @@
  *     un-provisioned for seed-gated device access.
  *   - v2 `{v:2, n, fb, epk, grant}` — nested full device-grant envelope
  *     (base64 from `encodeDeviceGrant`). Reuses standard grant validation
- *     (ts window, nonce, key_id, cid, aud, sig); the sealed box already
- *     binds fb/epk so the grant itself stays the plain device-grant shape
- *     with `cid=channel_id` and `aud=daemon_pubkey`.
+ *     (ts window, nonce, key_id, cid, aud, sig) with `cid=channel_id` and
+ *     `aud=daemon_pubkey`. Sealing to the daemon's public key authenticates
+ *     nobody, so a `dpk` grant also signs `use: "rtc"` and `bind = fb`: a
+ *     grant harvested from a plaintext `channel_open` cannot ride an offer
+ *     carrying someone else's DTLS fingerprint.
  *
  * Hosts supply seal/open via the existing sealed-box implementations
  * (`lib/daemon-seal.ts` / `packages/cli/daemon/src/keypair.ts`). Fingerprint

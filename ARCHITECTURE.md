@@ -61,7 +61,14 @@ enveloped (no relay hop — the data channel itself is the channel).
 
 - `device-grant.ts` — seed-gated device-access grant wire format (signed by the
   browser with the phrase-derived device-control key; verified by the daemon).
-  Capability negotiation uses `seedgate1` from `@openllmsh/protocol`.
+  Capability negotiation uses `seedgate1` from `@openllmsh/protocol`. Every
+  grant that carries `dpk` also signs its `use` — `channel` (a relay-mux
+  `channel_open`, which the relay reads in plaintext), `rtc` (bound to the
+  offer's DTLS fingerprint) or `noise` (bound to the Noise initiator's static
+  key, `noiseGrantBinding`) — and the daemon refuses a grant of one use
+  presented as another, so a harvested `channel_open` grant cannot seed-gate
+  an RTC offer or authenticate a Noise initiator. Grants without `dpk` keep
+  the legacy bytes (no `use`/`bind`) for daemons that predate the fields.
 - `device-control.ts` — device-control rotation v2 wire format
   (`label || 0x00 || {v:2, old, new, cv}`, no timestamp, signed by `old`) and
   the shared key fingerprint (`keyFingerprint` / `formatKeyFingerprint`).

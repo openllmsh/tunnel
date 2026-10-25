@@ -7,7 +7,12 @@
  */
 
 import { DEVICE_GRANT_B64_MAX } from "@openllmsh/protocol";
-import { decodeB64Json, encodeB64Json, labelledMessage } from "./wire-bytes";
+import {
+  decodeB64Json,
+  encodeB64Json,
+  labelledMessage,
+  toB64Bytes,
+} from "./wire-bytes";
 
 export { DEVICE_GRANT_B64_MAX };
 
@@ -38,7 +43,42 @@ export type TDeviceGrantFields = {
    * are unchanged.
    */
   readonly dpk?: string;
+  /**
+   * What the grant authorises ({@link TDeviceGrantUse}). Signed, so a grant
+   * minted for one purpose is refused for another: the relay sees every
+   * `channel_open` grant in plaintext, and without this it could replay one
+   * inside its own RTC offer or Noise handshake. Absent on legacy grants
+   * (and then absent from the signed message); required wherever `dpk` is.
+   */
+  readonly use?: TDeviceGrantUse;
+  /**
+   * The channel the grant is bound to, for uses that have one: the browser's
+   * DTLS fingerprint (`rtc`, the offer's sealed `fb`) or its Noise static key
+   * (`noise`, raw 32 bytes base64). A relay that harvests the grant cannot
+   * stand in for either.
+   */
+  readonly bind?: string;
 };
+
+/**
+ * - `channel`: a relay-mux `channel_open` (seen by the relay in plaintext).
+ * - `rtc`: an RTC offer's sealed grant; `bind` is the offer's DTLS fingerprint.
+ * - `noise`: the relay-mux agent Noise_IK message-1 payload; `bind` is the
+ *   initiator's static key.
+ */
+export const DEVICE_GRANT_USES = ["channel", "rtc", "noise"] as const;
+export type TDeviceGrantUse = (typeof DEVICE_GRANT_USES)[number];
+
+/**
+ * The `bind` of a `noise` grant: the initiator's raw 32-byte Noise static
+ * key, base64. Signer and verifier both derive it here so the bytes agree.
+ */
+export const noiseGrantBinding = (initiatorStatic: Uint8Array): string =>
+  toB64Bytes(initiatorStatic);
+
+const isDeviceGrantUse = (value: unknown): value is TDeviceGrantUse =>
+  typeof value === "string" &&
+  (DEVICE_GRANT_USES as readonly string[]).includes(value);
 
 export type TDeviceGrantEnvelope = TDeviceGrantFields & {
   readonly sig: string;
@@ -49,7 +89,8 @@ export type TDeviceGrantEnvelope = TDeviceGrantFields & {
  *
  * The JSON is canonical-by-construction: it is produced by
  * `JSON.stringify` of an object literal written in the fixed field
- * order `v, n, ts, key_id, cid, aud[, dpk]` (`dpk` only when present).
+ * order `v, n, ts, key_id, cid, aud[, dpk][, use][, bind]` (each optional
+ * field only when present, so legacy grant bytes are unchanged).
  * ECMAScript guarantees own string-keyed property enumeration (and
  * therefore stringify output) follows insertion order, so building the
  * literal in that order yields identical bytes for identical fields on
@@ -68,6 +109,8 @@ export const buildDeviceGrantMessage = (
       cid: fields.cid,
       aud: fields.aud,
       ...(fields.dpk === undefined ? {} : { dpk: fields.dpk }),
+      ...(fields.use === undefined ? {} : { use: fields.use }),
+      ...(fields.bind === undefined ? {} : { bind: fields.bind }),
     }),
   );
 
@@ -96,8 +139,9 @@ const isValidNonce = (value: unknown): value is string => {
 
 /**
  * Strict decode: returns null on any shape mismatch. `aud` may be the
- * empty string (legacy tunnel path); `dpk` may be absent (legacy grant) but,
- * when present, must be a non-empty string; every other string field must be
+ * empty string (legacy tunnel path); `dpk`, `use` and `bind` may be absent
+ * (legacy grant) but, when present, `dpk` and `bind` must be non-empty
+ * strings and `use` one of {@link DEVICE_GRANT_USES}; every other string field must be
  * non-empty, `v` must be exactly 1, `n` base64 of
  * {@link DEVICE_GRANT_NONCE_BYTES} bytes, and `ts` a finite positive integer.
  */
@@ -122,6 +166,8 @@ export const decodeDeviceGrant = (b64: string): TDeviceGrantEnvelope | null => {
   const dpk: string | undefined | null =
     rawDpk === undefined ? undefined : isNonEmptyString(rawDpk) ? rawDpk : null;
   if (dpk === null) return null;
+  if (o.use !== undefined && !isDeviceGrantUse(o.use)) return null;
+  if (o.bind !== undefined && !isNonEmptyString(o.bind)) return null;
   return {
     v: DEVICE_GRANT_VERSION,
     n: o.n,
@@ -130,6 +176,8 @@ export const decodeDeviceGrant = (b64: string): TDeviceGrantEnvelope | null => {
     cid: o.cid,
     aud: o.aud,
     ...(dpk === undefined ? {} : { dpk }),
+    ...(o.use === undefined ? {} : { use: o.use }),
+    ...(o.bind === undefined ? {} : { bind: o.bind }),
     sig: o.sig,
   };
 };
