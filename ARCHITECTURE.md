@@ -14,6 +14,7 @@
 | `streams.ts` | OPEN/CTRL/RESET helpers and fetch-shaped tunnel stream APIs (`tunnelStream` / `serveStream`) | Relay routing and WebSocket mechanics |
 | `stream-reset-error.ts` | Typed application-level reset error | Mux lifecycle or protocol parsing |
 | `device-grant.ts` | Canonical device-grant envelope encode/decode + message bytes (no crypto) | Vault DEK, node:crypto, host I/O |
+| `team-grant.ts` | Origin-signed team grant encode/decode + Ed25519 WebCrypto sign/verify | Vault DEK, DB, host I/O |
 | `rtc-duplex.ts` | ~20-line `TDuplex` over `RTCDataChannel` (DOM or werift) | Mux / payload schemas / auth |
 | `rtc-auth.ts` | Pure fingerprint binding, ICE-server, and SCTP payload-cap helpers; hosts supply seal/open | Crypto implementations, signaling |
 | `rtc-ice.ts` | Daemon-side mDNS ICE-candidate preflight for werift | RTC signaling, mux, or payload schemas |
@@ -69,6 +70,12 @@ enveloped (no relay hop — the data channel itself is the channel).
   presented as another, so a harvested `channel_open` grant cannot seed-gate
   an RTC offer or authenticate a Noise initiator. Grants without `dpk` keep
   the legacy bytes (no `use`/`bind`) for daemons that predate the fields.
+- `team-grant.ts` — origin-signed team device grant (Ed25519 WebCrypto). Short-
+  lived `{v, team_id, share_id, consumer, device_user_id, device_key_id, model,
+  n, exp[, cap_tokens]}` envelope for cross-user relay admission and contributor-
+  daemon re-check. The relay verifies against `TEAM_GRANT_PUBLIC_KEY`; daemons
+  pin `team_grant_pubkey` from bootstrap. Unknown future envelope fields are
+  ignored on decode.
 - `device-control.ts` — device-control rotation v2 wire format
   (`label || 0x00 || {v:2, old, new, cv}`, no timestamp, signed by `old`) and
   the shared key fingerprint (`keyFingerprint` / `formatKeyFingerprint`).

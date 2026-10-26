@@ -17,4 +17,5 @@ export * from "./rtc-duplex";
 export * from "./secure";
 export * from "./stream-reset-error";
 export * from "./streams";
+export * from "./team-grant";
 export * from "./wire-bytes";
