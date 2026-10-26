@@ -14,6 +14,18 @@ export const toB64Bytes = (bytes: Uint8Array): string => {
   return btoa(bin);
 };
 
+/** Inverse of {@link toB64Bytes}; null when `b64` is not valid standard base64. */
+export const fromB64Bytes = (b64: string): Uint8Array | null => {
+  try {
+    const bin = atob(b64);
+    const out = new Uint8Array(bin.length);
+    for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
+    return out;
+  } catch {
+    return null;
+  }
+};
+
 /**
  * Canonical signed bytes: `utf8(label) || 0x00 || utf8(json)`. Callers build
  * `json` from an object literal in a fixed key order, so identical fields

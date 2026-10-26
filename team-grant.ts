@@ -15,6 +15,7 @@ import { TEAM_GRANT_B64_MAX } from "@openllmsh/protocol";
 import {
   decodeB64Json,
   encodeB64Json,
+  fromB64Bytes,
   labelledMessage,
   toB64Bytes,
 } from "./wire-bytes";
@@ -163,19 +164,9 @@ export const decodeTeamGrant = (b64: string): TTeamGrantEnvelope | null => {
   };
 };
 
-const fromB64 = (b64: string): Uint8Array | null => {
-  try {
-    const bin = atob(b64);
-    const out = new Uint8Array(bin.length);
-    for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i);
-    return out;
-  } catch {
-    return null;
-  }
-};
 
 const spkiBytes = (spkiB64: string): Uint8Array | null => {
-  const spki = fromB64(spkiB64);
+  const spki = fromB64Bytes(spkiB64);
   if (spki === null || spki.length !== ED25519_SPKI_BYTES) return null;
   for (let i = 0; i < ED25519_SPKI_PREFIX.length; i++) {
     if (spki[i] !== ED25519_SPKI_PREFIX[i]) return null;
@@ -267,7 +258,7 @@ export const verifyTeamGrant = async (
   if (envelope.exp <= nowMs) return null;
   const key = await importVerifyKey(pubkeySpkiB64);
   if (key === null) return null;
-  const sig = fromB64(envelope.sig);
+  const sig = fromB64Bytes(envelope.sig);
   if (sig === null || sig.length !== ED25519_SIGNATURE_BYTES) return null;
   const { sig: _sig, ...fields } = envelope;
   const message = buildTeamGrantMessage(fields);
