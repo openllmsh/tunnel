@@ -1,49 +1,31 @@
 /**
  * Origin-signed team device grant. Short-lived admission for a cross-user
  * relay mux channel: the consumer may reach one contributor device for one
- * model. Wire is labelled canonical JSON + Ed25519 (WebCrypto); the relay and
- * daemon verify against the origin public key (bootstrap / env) — neither
- * holds the signing secret.
+ * model. Wire is labelled canonical JSON + HMAC-SHA256 (WebCrypto) under the
+ * per-contributor key derived at origin
+ * (`HMAC-SHA256(NEON_AUTH_COOKIE_SECRET, "openllm-team-grant-v1:" + userId)`).
+ * The contributor daemon verifies with the same key from bootstrap
+ * (`team_grant_key`). The relay does NOT verify — it only stamps
+ * `peer_user_id` and requires a non-empty `team_grant` for cross-user opens.
  *
  * Unknown future envelope fields are ignored on decode; the signed message is
- * rebuilt from the known field set only, so a v1 verifier stays compatible
+ * rebuilt from the known field set only, so a v2 verifier stays compatible
  * when optional fields are added later (each optional is part of the signed
- * bytes only when present).
+ * bytes only when present). v1 (Ed25519) envelopes are rejected.
  */
 
 import { TEAM_GRANT_B64_MAX } from "@openllmsh/protocol";
-import {
-  decodeB64Json,
-  encodeB64Json,
-  fromB64Bytes,
-  labelledMessage,
-  toB64Bytes,
-} from "./wire-bytes";
+import { decodeB64Json, encodeB64Json, labelledMessage } from "./wire-bytes";
 
 export { TEAM_GRANT_B64_MAX };
 
-export const TEAM_GRANT_LABEL = "openllm-team-grant-v1";
-export const TEAM_GRANT_VERSION = 1 as const;
+/** Canonical message label for the signed JSON body (format version). */
+export const TEAM_GRANT_LABEL = "openllm-team-grant-v2";
+export const TEAM_GRANT_VERSION = 2 as const;
 export const TEAM_GRANT_NONCE_BYTES = 16;
 
-/** DER SPKI prefix for an Ed25519 public key (RFC 8410). */
-const ED25519_SPKI_PREFIX = Uint8Array.from([
-  0x30, 0x2a, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x03, 0x21, 0x00,
-]);
-
-/** DER PKCS8 prefix for a 32-byte Ed25519 seed (RFC 8410). */
-const ED25519_PKCS8_PREFIX = Uint8Array.from([
-  0x30, 0x2e, 0x02, 0x01, 0x00, 0x30, 0x05, 0x06, 0x03, 0x2b, 0x65, 0x70, 0x04,
-  0x22, 0x04, 0x20,
-]);
-
-const ED25519_RAW_KEY_BYTES = 32;
-const ED25519_SIGNATURE_BYTES = 64;
-const ED25519_SPKI_BYTES = ED25519_SPKI_PREFIX.length + ED25519_RAW_KEY_BYTES;
-const ED25519_PKCS8_BYTES = ED25519_PKCS8_PREFIX.length + ED25519_RAW_KEY_BYTES;
-
 export type TTeamGrant = {
-  readonly v: 1;
+  readonly v: 2;
   readonly team_id: string;
   readonly share_id: string;
   /** Consumer user id (the member opening the channel). */
@@ -72,7 +54,7 @@ export type TTeamGrantEnvelope = TTeamGrant & {
 export type TTeamGrantSignFields = Omit<TTeamGrant, "v" | "n" | "exp"> & {
   readonly n?: string;
   readonly exp?: number;
-  readonly v?: 1;
+  readonly v?: 2;
 };
 
 const isNonEmptyString = (value: unknown): value is string =>
@@ -94,6 +76,38 @@ const isPositiveInt = (value: unknown): value is number =>
   Number.isFinite(value) &&
   Number.isInteger(value) &&
   value > 0;
+
+const isHex = (value: string): boolean =>
+  value.length > 0 && value.length % 2 === 0 && /^[0-9a-f]+$/i.test(value);
+
+const hexOf = (bytes: Uint8Array): string => {
+  let out = "";
+  for (let i = 0; i < bytes.length; i++) {
+    out += (bytes[i] as number).toString(16).padStart(2, "0");
+  }
+  return out;
+};
+
+const bytesOfHex = (hex: string): Uint8Array | null => {
+  if (!isHex(hex)) return null;
+  const out = new Uint8Array(hex.length / 2);
+  for (let i = 0; i < out.length; i++) {
+    const byte = Number.parseInt(hex.slice(i * 2, i * 2 + 2), 16);
+    if (!Number.isFinite(byte)) return null;
+    out[i] = byte;
+  }
+  return out;
+};
+
+/** Constant-time compare of equal-length byte arrays. */
+const timingSafeEqual = (a: Uint8Array, b: Uint8Array): boolean => {
+  if (a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i++) {
+    diff |= (a[i] as number) ^ (b[i] as number);
+  }
+  return diff === 0;
+};
 
 /**
  * Canonical signed bytes: `utf8(LABEL) || 0x00 || utf8(json)`.
@@ -129,7 +143,8 @@ export const encodeTeamGrant = (envelope: TTeamGrantEnvelope): string =>
 
 /**
  * Strict decode of known fields. Extra JSON keys are tolerated (forward
- * compatible) but never returned. Returns null on any known-field mismatch.
+ * compatible) but never returned. Returns null on any known-field mismatch
+ * (including rejected v1 envelopes).
  */
 export const decodeTeamGrant = (b64: string): TTeamGrantEnvelope | null => {
   const o = decodeB64Json(b64, TEAM_GRANT_B64_MAX);
@@ -143,7 +158,7 @@ export const decodeTeamGrant = (b64: string): TTeamGrantEnvelope | null => {
   if (!isNonEmptyString(o.model)) return null;
   if (!isValidNonce(o.n)) return null;
   if (!isPositiveInt(o.exp)) return null;
-  if (!isNonEmptyString(o.sig)) return null;
+  if (!isNonEmptyString(o.sig) || !isHex(o.sig)) return null;
   let capTokens: number | undefined;
   if (o.cap_tokens !== undefined) {
     if (!isPositiveInt(o.cap_tokens)) return null;
@@ -160,137 +175,72 @@ export const decodeTeamGrant = (b64: string): TTeamGrantEnvelope | null => {
     n: o.n,
     exp: o.exp,
     ...(capTokens === undefined ? {} : { cap_tokens: capTokens }),
-    sig: o.sig,
+    sig: o.sig.toLowerCase(),
   };
 };
 
-
-const spkiBytes = (spkiB64: string): Uint8Array | null => {
-  const spki = fromB64Bytes(spkiB64);
-  if (spki === null || spki.length !== ED25519_SPKI_BYTES) return null;
-  for (let i = 0; i < ED25519_SPKI_PREFIX.length; i++) {
-    if (spki[i] !== ED25519_SPKI_PREFIX[i]) return null;
-  }
-  return spki;
-};
-
-const pkcs8Bytes = (pkcs8: Uint8Array): Uint8Array | null => {
-  if (pkcs8.length !== ED25519_PKCS8_BYTES) return null;
-  for (let i = 0; i < ED25519_PKCS8_PREFIX.length; i++) {
-    if (pkcs8[i] !== ED25519_PKCS8_PREFIX[i]) return null;
-  }
-  return pkcs8;
-};
-
-const importVerifyKey = async (
-  pubkeySpkiB64: string,
-): Promise<CryptoKey | null> => {
-  const spki = spkiBytes(pubkeySpkiB64);
-  if (spki === null) return null;
+const hmacSha256Hex = async (
+  key: string,
+  message: Uint8Array,
+): Promise<string | null> => {
+  if (key.length === 0) return null;
   try {
-    return await globalThis.crypto.subtle.importKey(
-      "spki",
-      spki as BufferSource,
-      { name: "Ed25519" },
+    const cryptoKey = await globalThis.crypto.subtle.importKey(
+      "raw",
+      new TextEncoder().encode(key),
+      { name: "HMAC", hash: "SHA-256" },
       false,
-      ["verify"],
-    );
-  } catch {
-    return null;
-  }
-};
-
-const importSignKey = async (
-  privateKey: CryptoKey | Uint8Array,
-  extractable = false,
-): Promise<CryptoKey | null> => {
-  if (typeof CryptoKey !== "undefined" && privateKey instanceof CryptoKey) {
-    return privateKey;
-  }
-  const pkcs8 = pkcs8Bytes(privateKey as Uint8Array);
-  if (pkcs8 === null) return null;
-  try {
-    return await globalThis.crypto.subtle.importKey(
-      "pkcs8",
-      pkcs8 as BufferSource,
-      { name: "Ed25519" },
-      extractable,
       ["sign"],
     );
+    const sig = new Uint8Array(
+      await globalThis.crypto.subtle.sign(
+        "HMAC",
+        cryptoKey,
+        message as BufferSource,
+      ),
+    );
+    return hexOf(sig);
   } catch {
     return null;
   }
 };
 
 /**
- * Sign a team grant. `privateKey` is a WebCrypto Ed25519 CryptoKey or PKCS8
- * DER bytes. Returns the wire token, or null when the key cannot be imported.
+ * Sign a team grant with the per-contributor HMAC key (hex string, same
+ * shape as `perUserTeamGrantKey` / bootstrap `team_grant_key`). Returns the
+ * wire token, or null when the key is empty / HMAC fails.
  */
 export const signTeamGrant = async (
   fields: TTeamGrant,
-  privateKey: CryptoKey | Uint8Array,
+  hmacKey: string,
 ): Promise<string | null> => {
-  const key = await importSignKey(privateKey);
-  if (key === null) return null;
   const message = buildTeamGrantMessage(fields);
-  const sig = new Uint8Array(
-    await globalThis.crypto.subtle.sign(
-      "Ed25519",
-      key,
-      message as BufferSource,
-    ),
-  );
-  return encodeTeamGrant({ ...fields, sig: toB64Bytes(sig) });
+  const sig = await hmacSha256Hex(hmacKey, message);
+  if (sig === null) return null;
+  return encodeTeamGrant({ ...fields, sig });
 };
 
 /**
- * Verify a team-grant wire token against an origin SPKI public key (base64).
- * Returns the grant fields when the signature is valid and `exp > nowMs`;
- * otherwise null. Never throws.
+ * Verify a team-grant wire token against a per-contributor HMAC key.
+ * Returns the grant fields when the signature matches (constant-time) and
+ * `exp > nowMs`; otherwise null. Never throws. Rejects v1 envelopes.
  */
 export const verifyTeamGrant = async (
   token: string,
-  pubkeySpkiB64: string,
+  hmacKey: string,
   nowMs: number,
 ): Promise<TTeamGrant | null> => {
   const envelope = decodeTeamGrant(token);
   if (envelope === null) return null;
   if (envelope.exp <= nowMs) return null;
-  const key = await importVerifyKey(pubkeySpkiB64);
-  if (key === null) return null;
-  const sig = fromB64Bytes(envelope.sig);
-  if (sig === null || sig.length !== ED25519_SIGNATURE_BYTES) return null;
-  const { sig: _sig, ...fields } = envelope;
+  if (hmacKey.length === 0) return null;
+  const { sig, ...fields } = envelope;
   const message = buildTeamGrantMessage(fields);
-  try {
-    const ok = await globalThis.crypto.subtle.verify(
-      "Ed25519",
-      key,
-      sig as BufferSource,
-      message as BufferSource,
-    );
-    if (!ok) return null;
-  } catch {
-    return null;
-  }
+  const expected = await hmacSha256Hex(hmacKey, message);
+  if (expected === null) return null;
+  const a = bytesOfHex(expected);
+  const b = bytesOfHex(sig);
+  if (a === null || b === null) return null;
+  if (!timingSafeEqual(a, b)) return null;
   return fields;
-};
-
-/**
- * Export the SPKI public half of an already-generated Ed25519 key pair.
- * Prefer this over deriving SPKI from PKCS8: WebCrypto (Bun/Chrome) cannot
- * `exportKey("spki")` from a PKCS8-imported private key. Origin derives the
- * public key with node:crypto in `@openllm/api` `team-grant.ts`.
- */
-export const exportTeamGrantPublicKey = async (
-  publicKey: CryptoKey,
-): Promise<string | null> => {
-  try {
-    const spki = new Uint8Array(
-      await globalThis.crypto.subtle.exportKey("spki", publicKey),
-    );
-    return toB64Bytes(spki);
-  } catch {
-    return null;
-  }
 };
