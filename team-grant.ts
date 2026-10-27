@@ -15,7 +15,13 @@
  */
 
 import { TEAM_GRANT_B64_MAX } from "@openllmsh/protocol";
-import { decodeB64Json, encodeB64Json, labelledMessage } from "./wire-bytes";
+import {
+  decodeB64Json,
+  encodeB64Json,
+  isB64OfLength,
+  isNonEmptyString,
+  labelledMessage,
+} from "./wire-bytes";
 
 export { TEAM_GRANT_B64_MAX };
 
@@ -57,19 +63,8 @@ export type TTeamGrantSignFields = Omit<TTeamGrant, "v" | "n" | "exp"> & {
   readonly v?: 2;
 };
 
-const isNonEmptyString = (value: unknown): value is string =>
-  typeof value === "string" && value.length > 0;
-
-/** True when `n` is standard base64 of exactly {@link TEAM_GRANT_NONCE_BYTES}. */
-const isValidNonce = (value: unknown): value is string => {
-  if (!isNonEmptyString(value)) return false;
-  try {
-    const bin = atob(value);
-    return bin.length === TEAM_GRANT_NONCE_BYTES;
-  } catch {
-    return false;
-  }
-};
+const isValidNonce = (value: unknown): value is string =>
+  isB64OfLength(value, TEAM_GRANT_NONCE_BYTES);
 
 const isPositiveInt = (value: unknown): value is number =>
   typeof value === "number" &&

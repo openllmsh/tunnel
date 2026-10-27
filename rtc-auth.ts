@@ -37,6 +37,7 @@
 
 import type { TIceServer } from "@openllmsh/protocol";
 import { FRAME_HEADER_BYTES } from "./codec";
+import { isB64OfLength, isNonEmptyString } from "./wire-bytes";
 
 export const RTC_AUTH_VERSION = 1 as const;
 /** Default STUN server shared by browser and daemon RTC peers. */
@@ -340,18 +341,8 @@ export const negotiateRtcPayloadCap = (
   return Math.min(usable, wireMax);
 };
 
-const isNonEmptyString = (value: unknown): value is string =>
-  typeof value === "string" && value.length > 0;
-
-/** True when a nonce is base64 of exactly RTC_AUTH_NONCE_BYTES bytes. */
-const isValidNonce = (value: unknown): value is string => {
-  if (!isNonEmptyString(value)) return false;
-  try {
-    return atob(value).length === RTC_AUTH_NONCE_BYTES;
-  } catch {
-    return false;
-  }
-};
+const isValidNonce = (value: unknown): value is string =>
+  isB64OfLength(value, RTC_AUTH_NONCE_BYTES);
 
 export const encodeOfferInner = (inner: TRtcOfferInner): string => {
   if (inner.v === RTC_AUTH_VERSION_2) {

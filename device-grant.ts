@@ -10,6 +10,8 @@ import { DEVICE_GRANT_B64_MAX } from "@openllmsh/protocol";
 import {
   decodeB64Json,
   encodeB64Json,
+  isB64OfLength,
+  isNonEmptyString,
   labelledMessage,
   toB64Bytes,
 } from "./wire-bytes";
@@ -122,20 +124,8 @@ export const encodeDeviceGrant = (envelope: TDeviceGrantEnvelope): string =>
     "device grant exceeds DEVICE_GRANT_B64_MAX",
   );
 
-const isNonEmptyString = (value: unknown): value is string => {
-  return typeof value === "string" && value.length > 0;
-};
-
-/** True when `n` is base64 of exactly {@link DEVICE_GRANT_NONCE_BYTES} bytes. */
-const isValidNonce = (value: unknown): value is string => {
-  if (!isNonEmptyString(value)) return false;
-  try {
-    const bin = atob(value);
-    return bin.length === DEVICE_GRANT_NONCE_BYTES;
-  } catch {
-    return false;
-  }
-};
+const isValidNonce = (value: unknown): value is string =>
+  isB64OfLength(value, DEVICE_GRANT_NONCE_BYTES);
 
 /**
  * Strict decode: returns null on any shape mismatch. `aud` may be the

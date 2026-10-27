@@ -83,3 +83,20 @@ export const decodeB64Json = (
   }
   return parsed as Record<string, unknown>;
 };
+
+/** A non-empty string field. */
+export const isNonEmptyString = (value: unknown): value is string =>
+  typeof value === "string" && value.length > 0;
+
+/** True when `value` is standard base64 of exactly `bytes` bytes (a nonce). */
+export const isB64OfLength = (
+  value: unknown,
+  bytes: number,
+): value is string => {
+  if (!isNonEmptyString(value)) return false;
+  try {
+    return atob(value).length === bytes;
+  } catch {
+    return false;
+  }
+};
