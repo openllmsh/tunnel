@@ -884,6 +884,9 @@ export type TAgentStreamResult = {
   readonly onEvent: (handler: (event: TAgentEvent) => void) => () => void;
   /** Fires once when an attach replay finishes (`replay_done` CTRL). Latched. */
   readonly onReplayDone: (callback: () => void) => () => void;
+  /** Browser device-session focus controls; old daemons ignore these CTRLs. */
+  readonly focus: () => void;
+  readonly blur: () => void;
   /** End the stream, leaving the engine session running for a later attach. */
   readonly detach: () => void;
   /** Send `close` (end the engine session), then end the stream. */
@@ -1080,6 +1083,12 @@ export const agentStream = (
           return () => {
             replayHandlers.delete(callback);
           };
+        },
+        focus: () => {
+          if (!closedResult) stream.sendCtrl(encodeJsonPayload({ t: "focus" }));
+        },
+        blur: () => {
+          if (!closedResult) stream.sendCtrl(encodeJsonPayload({ t: "blur" }));
         },
         detach: () => {
           stream.end();
