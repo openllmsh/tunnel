@@ -304,7 +304,10 @@ export const createChannel = (options: TCreateChannelOptions): TMuxChannel => {
           sendEndIfReady(state);
           sent = true;
         }
-        roundRobinStart = (start + 1) % pendingStates.length;
+        // Every active stream received one quantum above. Keep the next pass at
+        // the same logical head so consecutive passes stay cyclic (A,B,A,B),
+        // rather than giving the last stream of one pass two adjacent turns.
+        roundRobinStart = start;
         if (!sent) break;
       }
     } finally {
