@@ -211,6 +211,11 @@ export type TRtcOfferInnerV2 = {
   readonly epk: string;
   /** Full device-grant envelope (base64). */
   readonly grant: string;
+  /**
+   * Opaque origin-signed team grant, sealed end-to-end with the offer. This is
+   * additive so pre-team v2 inners continue to decode for same-user traffic.
+   */
+  readonly teamGrant?: string;
 };
 
 export type TRtcOfferInner = TRtcOfferInnerV1 | TRtcOfferInnerV2;
@@ -352,6 +357,7 @@ export const encodeOfferInner = (inner: TRtcOfferInner): string => {
       fb: normalizeFingerprint(inner.fb),
       epk: inner.epk,
       grant: inner.grant,
+      ...(inner.teamGrant !== undefined ? { team_grant: inner.teamGrant } : {}),
     });
   }
   return JSON.stringify({
@@ -382,6 +388,7 @@ export const decodeOfferInner = (json: string): TRtcOfferInner | null => {
         fb: normalizeFingerprint(o.fb),
         epk: o.epk,
         grant: o.grant,
+        ...(isNonEmptyString(o.team_grant) ? { teamGrant: o.team_grant } : {}),
       };
     }
     if (o.v !== RTC_AUTH_VERSION) return null;
