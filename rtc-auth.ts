@@ -18,11 +18,9 @@
  *      its local fingerprint, and Fd matches the fingerprint in the answer
  *      SDP — only then completes DTLS / marks the channel open.
  *
- * Offer-inner versions:
- *   - v1 `{v:1, n, fb, epk}` — legacy, accepted only when the daemon is
- *     un-provisioned for seed-gated device access.
- *   - v2 `{v:2, n, fb, epk, grant}` — nested full device-grant envelope
- *     (base64 from `encodeDeviceGrant`). Reuses standard grant validation
+ * Offer-inner version:
+ *   - v2 `{v:2, n, fb, epk, grant, team_grant?}` — nested full device-grant
+ *     envelope (base64 from `encodeDeviceGrant`). Reuses standard grant validation
  *     (ts window, nonce, key_id, cid, aud, sig) with `cid=channel_id` and
  *     `aud=daemon_pubkey`. Sealing to the daemon's public key authenticates
  *     nobody, so a `dpk` grant also signs `use: "rtc"` and `bind = fb`: a
@@ -39,7 +37,7 @@ import type { TIceServer } from "@openllmsh/protocol";
 import { FRAME_HEADER_BYTES } from "./codec";
 import { isB64OfLength, isNonEmptyString } from "./wire-bytes";
 
-export const RTC_AUTH_VERSION = 1 as const;
+export const RTC_AUTH_VERSION = 2 as const;
 /** Default STUN server shared by browser and daemon RTC peers. */
 export const RTC_DEFAULT_STUN = "stun:stun.l.google.com:19302";
 
@@ -176,8 +174,6 @@ export const resolveIceServers = (
   return defaultIceServers();
 };
 
-/** Seed-gated offer inner: nests a full device-grant envelope. */
-export const RTC_AUTH_VERSION_2 = 2 as const;
 /** 16 random bytes, base64-encoded in the inner JSON. */
 export const RTC_AUTH_NONCE_BYTES = 16;
 /**
@@ -188,37 +184,22 @@ export const RTC_SAFE_MAX_PAYLOAD_BYTES = 16 * 1024;
 /** Header bytes reserved so a mux frame fits inside an SCTP message. */
 export const RTC_MUX_HEADER_OVERHEAD = FRAME_HEADER_BYTES;
 
-export type TRtcOfferInnerV1 = {
-  readonly v: typeof RTC_AUTH_VERSION;
-  /** base64 of RTC_AUTH_NONCE_BYTES random bytes */
-  readonly n: string;
-  /** browser DTLS fingerprint, already normalized */
-  readonly fb: string;
-  /** browser ephemeral X25519 public key (SPKI DER, base64) for the answer seal */
-  readonly epk: string;
-};
-
 /**
- * v2 offer inner. `grant` is the full `encodeDeviceGrant(...)` envelope
+ * Current offer inner. `grant` is the full `encodeDeviceGrant(...)` envelope
  * string (base64 JSON). Nested rather than flat sig fields so the daemon
  * reuses `checkDeviceGrant` (ts window, nonce LRU, key_id/cid/aud/sig)
  * without a parallel validation path.
  */
-export type TRtcOfferInnerV2 = {
-  readonly v: typeof RTC_AUTH_VERSION_2;
+export type TRtcOfferInner = {
+  readonly v: typeof RTC_AUTH_VERSION;
   readonly n: string;
   readonly fb: string;
   readonly epk: string;
-  /** Full device-grant envelope (base64). */
-  readonly grant: string;
-  /**
-   * Opaque origin-signed team grant, sealed end-to-end with the offer. This is
-   * additive so pre-team v2 inners continue to decode for same-user traffic.
-   */
+  /** Full device-grant envelope (base64), required only for browser offers. */
+  readonly grant?: string;
+  /** Opaque origin-signed team grant, sealed end-to-end with the offer. */
   readonly teamGrant?: string;
 };
-
-export type TRtcOfferInner = TRtcOfferInnerV1 | TRtcOfferInnerV2;
 
 export type TRtcAnswerInner = {
   readonly v: typeof RTC_AUTH_VERSION;
@@ -349,24 +330,15 @@ export const negotiateRtcPayloadCap = (
 const isValidNonce = (value: unknown): value is string =>
   isB64OfLength(value, RTC_AUTH_NONCE_BYTES);
 
-export const encodeOfferInner = (inner: TRtcOfferInner): string => {
-  if (inner.v === RTC_AUTH_VERSION_2) {
-    return JSON.stringify({
-      v: RTC_AUTH_VERSION_2,
-      n: inner.n,
-      fb: normalizeFingerprint(inner.fb),
-      epk: inner.epk,
-      grant: inner.grant,
-      ...(inner.teamGrant !== undefined ? { team_grant: inner.teamGrant } : {}),
-    });
-  }
-  return JSON.stringify({
+export const encodeOfferInner = (inner: TRtcOfferInner): string =>
+  JSON.stringify({
     v: RTC_AUTH_VERSION,
     n: inner.n,
     fb: normalizeFingerprint(inner.fb),
     epk: inner.epk,
+    ...(inner.grant !== undefined ? { grant: inner.grant } : {}),
+    ...(inner.teamGrant !== undefined ? { team_grant: inner.teamGrant } : {}),
   });
-};
 
 export const decodeOfferInner = (json: string): TRtcOfferInner | null => {
   try {
@@ -380,23 +352,14 @@ export const decodeOfferInner = (json: string): TRtcOfferInner | null => {
     ) {
       return null;
     }
-    if (o.v === RTC_AUTH_VERSION_2) {
-      if (!isNonEmptyString(o.grant)) return null;
-      return {
-        v: RTC_AUTH_VERSION_2,
-        n: o.n,
-        fb: normalizeFingerprint(o.fb),
-        epk: o.epk,
-        grant: o.grant,
-        ...(isNonEmptyString(o.team_grant) ? { teamGrant: o.team_grant } : {}),
-      };
-    }
     if (o.v !== RTC_AUTH_VERSION) return null;
     return {
       v: RTC_AUTH_VERSION,
       n: o.n,
       fb: normalizeFingerprint(o.fb),
       epk: o.epk,
+      ...(isNonEmptyString(o.grant) ? { grant: o.grant } : {}),
+      ...(isNonEmptyString(o.team_grant) ? { teamGrant: o.team_grant } : {}),
     };
   } catch {
     return null;
