@@ -89,9 +89,13 @@ const cacheKeyOf = (target: string, path: TPeerLinkPath): string =>
 
 /** Shared negative-cache operations for host dialers outside a ladder instance. */
 export const peerLinkFailureCache = {
-  clear(target?: string): void {
+  clear(target?: string, path?: TPeerLinkPath): void {
     if (target === undefined) {
       failureCache.clear();
+      return;
+    }
+    if (path !== undefined) {
+      failureCache.delete(cacheKeyOf(target, path));
       return;
     }
     for (const key of failureCache.keys()) {
@@ -105,6 +109,14 @@ export const peerLinkFailureCache = {
     if (until > now) return true;
     failureCache.delete(key);
     return false;
+  },
+  until(target: string, path: TPeerLinkPath, now = Date.now()): number | null {
+    const key = cacheKeyOf(target, path);
+    const until = failureCache.get(key);
+    if (until === undefined) return null;
+    if (until > now) return until;
+    failureCache.delete(key);
+    return null;
   },
   set(
     target: string,
