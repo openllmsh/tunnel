@@ -19,6 +19,14 @@ export type TDuplex = {
   readonly send: (bytes: Uint8Array) => void;
   readonly onBytes: (callback: (bytes: Uint8Array | null) => void) => void;
   readonly close: () => void;
+  /**
+   * Optional outbound-transport backpressure contract. Hosts which buffer
+   * outgoing messages report their current queue and notify after it drops
+   * below their low watermark. Absent fields preserve eager legacy behavior.
+   */
+  readonly bufferedAmount?: () => number;
+  readonly highWaterMark?: number;
+  readonly onDrain?: (callback: () => void) => () => void;
 };
 
 export type TChannelSide = "consumer" | "daemon";
@@ -210,9 +218,11 @@ export const createChannel = (options: TCreateChannelOptions): TMuxChannel => {
     );
   };
 
+  let removeDrainListener: (() => void) | undefined;
   const close = (reason: TMuxCloseReason = "done"): void => {
     if (closed) return;
     closed = true;
+    removeDrainListener?.();
     for (const state of [...streams.values()]) localReset(state);
     try {
       options.duplex.close();
@@ -248,31 +258,62 @@ export const createChannel = (options: TCreateChannelOptions): TMuxChannel => {
     tryRetireStreamState(state);
   };
 
-  const drain = (state: TStreamState): void => {
-    while (
-      !closed &&
-      !state.reset &&
-      state.sendCredit > 0 &&
-      state.pending.length > 0
-    ) {
-      const pending = state.pending[0];
-      const remaining = pending.bytes.byteLength - pending.offset;
-      const size = Math.min(remaining, state.sendCredit, maxPayloadBytes);
-      if (size <= 0) break;
-      const chunk = pending.bytes.subarray(
-        pending.offset,
-        pending.offset + size,
-      );
-      send(FRAME_TYPE.data, state.id, chunk);
-      pending.offset += size;
-      state.sendCredit -= size;
-      if (pending.offset === pending.bytes.byteLength) {
-        state.pending.shift();
-        pending.resolve();
-      }
-    }
-    sendEndIfReady(state);
+  const transportBackpressured = (): boolean => {
+    const bufferedAmount = options.duplex.bufferedAmount;
+    const highWaterMark = options.duplex.highWaterMark;
+    return (
+      bufferedAmount !== undefined &&
+      highWaterMark !== undefined &&
+      bufferedAmount() >= highWaterMark
+    );
   };
+
+  let draining = false;
+  let roundRobinStart = 0;
+  const drainPendingWrites = (): void => {
+    if (draining || closed || transportBackpressured()) return;
+    draining = true;
+    try {
+      while (!closed && !transportBackpressured()) {
+        const pendingStates = [...streams.values()].filter(
+          (state) =>
+            !state.reset && state.sendCredit > 0 && state.pending.length > 0,
+        );
+        if (pendingStates.length === 0) break;
+        const start = roundRobinStart % pendingStates.length;
+        let sent = false;
+        for (let offset = 0; offset < pendingStates.length; offset += 1) {
+          if (transportBackpressured()) break;
+          const index = (start + offset) % pendingStates.length;
+          const state = pendingStates[index];
+          const pending = state.pending[0];
+          const remaining = pending.bytes.byteLength - pending.offset;
+          const size = Math.min(remaining, state.sendCredit, maxPayloadBytes);
+          if (size <= 0) continue;
+          send(
+            FRAME_TYPE.data,
+            state.id,
+            pending.bytes.subarray(pending.offset, pending.offset + size),
+          );
+          pending.offset += size;
+          state.sendCredit -= size;
+          if (pending.offset === pending.bytes.byteLength) {
+            state.pending.shift();
+            pending.resolve();
+          }
+          sendEndIfReady(state);
+          sent = true;
+        }
+        roundRobinStart = (start + 1) % pendingStates.length;
+        if (!sent) break;
+      }
+    } finally {
+      draining = false;
+    }
+  };
+
+  const drain = (_state: TStreamState): void => drainPendingWrites();
+  removeDrainListener = options.duplex.onDrain?.(drainPendingWrites);
 
   const makeState = (id: number, openedByPeer: boolean): TStreamState => ({
     id,
@@ -306,52 +347,45 @@ export const createChannel = (options: TCreateChannelOptions): TMuxChannel => {
         if (state.reset || closed)
           return Promise.reject(new Error("stream is closed"));
         if (bytes.byteLength === 0) return Promise.resolve();
-        // Fast path: when nothing is queued, send from the caller's buffer and
-        // only copy a remainder if credit runs out mid-write.
-        if (state.pending.length === 0) {
-          let offset = 0;
+        // Send at most one immediate frame. The remainder joins the fair
+        // round-robin queue, so a large first writer cannot monopolize the
+        // transport before another stream gets a turn.
+        let offset = 0;
+        if (
+          state.pending.length === 0 &&
+          state.sendCredit > 0 &&
+          !transportBackpressured()
+        ) {
+          const size = Math.min(
+            bytes.byteLength,
+            state.sendCredit,
+            maxPayloadBytes,
+          );
           try {
-            while (
-              !closed &&
-              !state.reset &&
-              state.sendCredit > 0 &&
-              offset < bytes.byteLength
-            ) {
-              const size = Math.min(
-                bytes.byteLength - offset,
-                state.sendCredit,
-                maxPayloadBytes,
-              );
-              if (size <= 0) break;
-              send(
-                FRAME_TYPE.data,
-                state.id,
-                bytes.subarray(offset, offset + size),
-              );
-              offset += size;
-              state.sendCredit -= size;
-            }
+            send(FRAME_TYPE.data, state.id, bytes.subarray(0, size));
           } catch (error) {
             return Promise.reject(
               error instanceof Error ? error : new Error(String(error)),
             );
           }
-          if (offset === bytes.byteLength) return Promise.resolve();
-          // send() may have closed/reset mid-loop (e.g. duplex side-effect).
-          // Do not enqueue onto a pending queue localReset already drained.
-          if (state.reset || closed) {
+          offset = size;
+          state.sendCredit -= size;
+          if (state.reset || closed)
             return Promise.reject(new Error("stream is closed"));
-          }
-          const queued = new Uint8Array(bytes.subarray(offset));
-          return new Promise<void>((resolve, reject) => {
-            state.pending.push({ bytes: queued, offset: 0, resolve, reject });
-            drain(state);
-          });
+          if (offset === bytes.byteLength) return Promise.resolve();
         }
-        const queued = new Uint8Array(bytes);
+        const queued = new Uint8Array(bytes.subarray(offset));
         return new Promise<void>((resolve, reject) => {
           state.pending.push({ bytes: queued, offset: 0, resolve, reject });
-          drain(state);
+          try {
+            drain(state);
+          } catch (error) {
+            const index = state.pending.findIndex(
+              (item) => item.reject === reject,
+            );
+            if (index >= 0) state.pending.splice(index, 1);
+            reject(error instanceof Error ? error : new Error(String(error)));
+          }
         });
       },
       end: () => {

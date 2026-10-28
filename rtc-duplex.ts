@@ -24,6 +24,7 @@ import type { TDuplex } from "./mux";
 export type TRtcDataChannelLike = {
   readonly readyState: string;
   readonly bufferedAmount: number;
+  bufferedAmountLowThreshold?: number;
   send: (data: string | ArrayBuffer | ArrayBufferView) => void;
   close: () => void;
   /**
@@ -62,8 +63,16 @@ const toUint8 = (data: unknown): Uint8Array | null => {
  */
 export const rtcDuplex = (dc: TRtcDataChannelLike): TDuplex => {
   let listener: ((bytes: Uint8Array | null) => void) | null = null;
+  const drainListeners = new Set<() => void>();
   let peerGone = false;
   let channelClosed = false;
+  const highWaterMark = 1024 * 1024;
+  const lowWaterMark = highWaterMark / 2;
+  try {
+    dc.bufferedAmountLowThreshold = lowWaterMark;
+  } catch {
+    // werift versions without the DOM setter still expose bufferedAmount.
+  }
 
   const closeChannel = (): void => {
     if (channelClosed) return;
@@ -102,10 +111,15 @@ export const rtcDuplex = (dc: TRtcDataChannelLike): TDuplex => {
     deliver(null);
   };
 
+  const onBufferedAmountLow = (): void => {
+    for (const callback of drainListeners) callback();
+  };
+
   if (typeof dc.addEventListener === "function") {
     dc.addEventListener("message", onMessage);
     dc.addEventListener("close", onPeerGone);
     dc.addEventListener("error", onPeerGone);
+    dc.addEventListener("bufferedamountlow", onBufferedAmountLow);
   } else {
     dc.onmessage = onMessage;
     dc.onclose = onPeerGone;
@@ -129,6 +143,12 @@ export const rtcDuplex = (dc: TRtcDataChannelLike): TDuplex => {
       } catch {
         onPeerGone();
       }
+    },
+    bufferedAmount: () => dc.bufferedAmount,
+    highWaterMark,
+    onDrain: (callback) => {
+      drainListeners.add(callback);
+      return () => drainListeners.delete(callback);
     },
     onBytes: (callback) => {
       listener = callback;
