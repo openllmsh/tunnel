@@ -19,14 +19,10 @@ export type TDuplex = {
   readonly send: (bytes: Uint8Array) => void;
   readonly onBytes: (callback: (bytes: Uint8Array | null) => void) => void;
   readonly close: () => void;
-  /**
-   * Optional outbound-transport backpressure contract. Hosts which buffer
-   * outgoing messages report their current queue and notify after it drops
-   * below their low watermark. Absent fields preserve eager legacy behavior.
-   */
-  readonly bufferedAmount?: () => number;
-  readonly highWaterMark?: number;
-  readonly onDrain?: (callback: () => void) => () => void;
+  /** Outbound-transport backpressure contract. */
+  readonly bufferedAmount: () => number;
+  readonly highWaterMark: number;
+  readonly onDrain: (callback: () => void) => () => void;
 };
 
 export type TChannelSide = "consumer" | "daemon";
@@ -258,20 +254,28 @@ export const createChannel = (options: TCreateChannelOptions): TMuxChannel => {
     tryRetireStreamState(state);
   };
 
-  const transportBackpressured = (): boolean => {
-    const bufferedAmount = options.duplex.bufferedAmount;
-    const highWaterMark = options.duplex.highWaterMark;
-    return (
-      bufferedAmount !== undefined &&
-      highWaterMark !== undefined &&
-      bufferedAmount() >= highWaterMark
-    );
-  };
+  const transportBackpressured = (): boolean =>
+    options.duplex.bufferedAmount() >= options.duplex.highWaterMark;
 
   let draining = false;
   let roundRobinStart = 0;
+  const stopDrainListener = (): void => {
+    removeDrainListener?.();
+    removeDrainListener = undefined;
+  };
+  const waitForDrain = (): void => {
+    if (removeDrainListener !== undefined || closed) return;
+    removeDrainListener = options.duplex.onDrain(() => {
+      stopDrainListener();
+      drainPendingWrites();
+    });
+  };
   const drainPendingWrites = (): void => {
-    if (draining || closed || transportBackpressured()) return;
+    if (draining || closed) return;
+    if (transportBackpressured()) {
+      waitForDrain();
+      return;
+    }
     draining = true;
     try {
       while (!closed && !transportBackpressured()) {
@@ -312,11 +316,12 @@ export const createChannel = (options: TCreateChannelOptions): TMuxChannel => {
       }
     } finally {
       draining = false;
+      if (transportBackpressured()) waitForDrain();
+      else stopDrainListener();
     }
   };
 
   const drain = (_state: TStreamState): void => drainPendingWrites();
-  removeDrainListener = options.duplex.onDrain?.(drainPendingWrites);
 
   const makeState = (id: number, openedByPeer: boolean): TStreamState => ({
     id,

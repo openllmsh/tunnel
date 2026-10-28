@@ -862,6 +862,9 @@ export const secureDuplex = async (
 
   return {
     send,
+    bufferedAmount: duplex.bufferedAmount,
+    highWaterMark: duplex.highWaterMark,
+    onDrain: duplex.onDrain,
     onBytes: (callback) => {
       listener = callback;
       if (pendingMessages.length === 0) return;
