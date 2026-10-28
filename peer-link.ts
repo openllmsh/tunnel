@@ -35,7 +35,10 @@ export type TPeerLinkDialer = {
   /** Begins a best-effort warm-up; it must not reject the caller's request. */
   readonly warm?: () => void;
   /** Dials (or joins) a channel. `null` means this rung is unavailable. */
-  readonly dial: (timeoutMs: number) => Promise<TMuxChannel | null>;
+  readonly dial: (
+    timeoutMs: number,
+    signal: AbortSignal,
+  ) => Promise<TMuxChannel | null>;
   /** Host teardown hook for a channel that failed before dispatch. */
   readonly drop?: (channel: TMuxChannel) => void;
 };
@@ -92,7 +95,19 @@ const failureTtlMs = (reason: TPeerLinkFailureReason): number => {
   }
 };
 
+const MAX_FAILURE_CACHE_ENTRIES = 1_024;
 const failureCache = new Map<string, number>();
+
+const sweepFailureCache = (now: number): void => {
+  for (const [key, until] of failureCache) {
+    if (until <= now) failureCache.delete(key);
+  }
+  while (failureCache.size > MAX_FAILURE_CACHE_ENTRIES) {
+    const oldest = failureCache.keys().next().value;
+    if (oldest === undefined) return;
+    failureCache.delete(oldest);
+  }
+};
 
 const cacheKeyOf = (target: string, path: TPeerLinkPath): string =>
   `${target}\u0000${path}`;
@@ -135,7 +150,13 @@ export const peerLinkFailureCache = {
     now = Date.now(),
   ): void {
     const ttl = failureTtlMs(reason);
-    if (ttl > 0) failureCache.set(cacheKeyOf(target, path), now + ttl);
+    sweepFailureCache(now);
+    if (ttl > 0) {
+      const key = cacheKeyOf(target, path);
+      failureCache.delete(key);
+      failureCache.set(key, now + ttl);
+      sweepFailureCache(now);
+    }
   },
 };
 
@@ -166,7 +187,9 @@ export const createPeerLink = (options: TPeerLinkOptions): TPeerLink => {
     options.policy?.rtcProbeMs ?? Math.min(2_000, openBudgetMs);
   const idleTtlMs = options.policy?.idleTtlMs ?? PEER_LINK_DEFAULTS.idleTtlMs;
   const classify = options.policy?.classifyFailure ?? peerLinkFailureReasonOf;
-  const retrySafe = options.policy?.retrySafe ?? (() => true);
+  // Retrying a dispatched inference can duplicate provider work. Callers must
+  // prove that the failure happened before dispatch to opt into a fallback.
+  const retrySafe = options.policy?.retrySafe ?? (() => false);
   const idleTimers = new Map<TMuxChannel, ReturnType<typeof setTimeout>>();
 
   const emit = (event: TPeerLinkEvent): void => options.onEvent?.(event);
@@ -214,16 +237,52 @@ export const createPeerLink = (options: TPeerLinkOptions): TPeerLink => {
     };
   };
 
+  const dialWithin = async (
+    dialer: TPeerLinkDialer,
+    timeoutMs: number,
+  ): Promise<TMuxChannel | null> => {
+    const controller = new AbortController();
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timedOut = new Promise<never>((_, reject) => {
+      timer = setTimeout(() => {
+        controller.abort();
+        reject(new DOMException("Timed out", "AbortError"));
+      }, timeoutMs);
+    });
+    try {
+      return await Promise.race([
+        dialer.dial(timeoutMs, controller.signal),
+        timedOut,
+      ]);
+    } finally {
+      if (timer !== undefined) clearTimeout(timer);
+      controller.abort();
+    }
+  };
+
   const channel = async (): Promise<TPeerLinkChannel | null> => {
     const startedAt = now();
     const rtc = options.rtc;
     if (rtc !== undefined && !cached("rtc")) {
       const open = rtc.open();
       if (open !== null) return resultOf("rtc", rtc, open, true, startedAt);
-      rtc.warm?.();
+      try {
+        rtc.warm?.();
+      } catch (error) {
+        cache("rtc", error);
+        emit({
+          type: "fallback",
+          path: "rtc",
+          reason: classify(error),
+          reused: false,
+        });
+      }
       if (rtcMode === "probe") {
         try {
-          const probe = await rtc.dial(Math.min(rtcProbeMs, openBudgetMs));
+          const probe = await dialWithin(
+            rtc,
+            Math.min(rtcProbeMs, openBudgetMs),
+          );
           if (probe !== null)
             return resultOf("rtc", rtc, probe, false, startedAt);
         } catch (error) {
@@ -241,7 +300,7 @@ export const createPeerLink = (options: TPeerLinkOptions): TPeerLink => {
     const remaining = Math.max(0, openBudgetMs - (now() - startedAt));
     if (remaining === 0) return null;
     try {
-      const mux = await options.mux.dial(remaining);
+      const mux = await dialWithin(options.mux, remaining);
       if (mux === null) return null;
       return resultOf(
         "mux",
