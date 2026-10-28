@@ -286,6 +286,7 @@ export const createChannel = (options: TCreateChannelOptions): TMuxChannel => {
         if (pendingStates.length === 0) break;
         const start = roundRobinStart % pendingStates.length;
         let sent = false;
+        let lastSentIndex: number | null = null;
         for (let offset = 0; offset < pendingStates.length; offset += 1) {
           if (transportBackpressured()) break;
           const index = (start + offset) % pendingStates.length;
@@ -307,11 +308,15 @@ export const createChannel = (options: TCreateChannelOptions): TMuxChannel => {
           }
           sendEndIfReady(state);
           sent = true;
+          lastSentIndex = index;
         }
-        // Every active stream received one quantum above. Keep the next pass at
-        // the same logical head so consecutive passes stay cyclic (A,B,A,B),
-        // rather than giving the last stream of one pass two adjacent turns.
-        roundRobinStart = start;
+        // A complete pass keeps its logical head (A,B,A,B). If the transport
+        // stopped us mid-pass, resume after the last stream that sent so later
+        // streams cannot be starved by repeated drain events.
+        roundRobinStart =
+          transportBackpressured() && lastSentIndex !== null
+            ? (lastSentIndex + 1) % pendingStates.length
+            : start;
         if (!sent) break;
       }
     } finally {
