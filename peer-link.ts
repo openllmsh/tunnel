@@ -52,6 +52,8 @@ export type TPeerLinkPolicy = {
 };
 
 export type TPeerLinkOptions = {
+  /** Stable peer identity; scopes the shared failure cache. */
+  readonly target: string;
   readonly rtc?: TPeerLinkDialer;
   readonly mux: TPeerLinkDialer;
   readonly policy?: TPeerLinkPolicy;
@@ -80,6 +82,41 @@ const failureTtlMs = (reason: TPeerLinkFailureReason): number => {
   }
 };
 
+const failureCache = new Map<string, number>();
+
+const cacheKeyOf = (target: string, path: TPeerLinkPath): string =>
+  `${target}\u0000${path}`;
+
+/** Shared negative-cache operations for host dialers outside a ladder instance. */
+export const peerLinkFailureCache = {
+  clear(target?: string): void {
+    if (target === undefined) {
+      failureCache.clear();
+      return;
+    }
+    for (const key of failureCache.keys()) {
+      if (key.startsWith(`${target}\u0000`)) failureCache.delete(key);
+    }
+  },
+  has(target: string, path: TPeerLinkPath, now = Date.now()): boolean {
+    const key = cacheKeyOf(target, path);
+    const until = failureCache.get(key);
+    if (until === undefined) return false;
+    if (until > now) return true;
+    failureCache.delete(key);
+    return false;
+  },
+  set(
+    target: string,
+    path: TPeerLinkPath,
+    reason: TPeerLinkFailureReason,
+    now = Date.now(),
+  ): void {
+    const ttl = failureTtlMs(reason);
+    if (ttl > 0) failureCache.set(cacheKeyOf(target, path), now + ttl);
+  },
+};
+
 const defaultReasonOf = (error: unknown): TPeerLinkFailureReason => {
   if (error instanceof DOMException && error.name === "AbortError") {
     return "aborted";
@@ -105,21 +142,14 @@ export const createPeerLink = (options: TPeerLinkOptions) => {
   const idleTtlMs = options.policy?.idleTtlMs ?? PEER_LINK_DEFAULTS.idleTtlMs;
   const classify = options.policy?.classifyFailure ?? defaultReasonOf;
   const retrySafe = options.policy?.retrySafe ?? (() => true);
-  const failedUntil = new Map<TPeerLinkPath, number>();
   const idleTimers = new Map<TMuxChannel, ReturnType<typeof setTimeout>>();
 
   const emit = (event: TPeerLinkEvent): void => options.onEvent?.(event);
-  const cached = (path: TPeerLinkPath): boolean => {
-    const until = failedUntil.get(path);
-    if (until === undefined) return false;
-    if (until > now()) return true;
-    failedUntil.delete(path);
-    return false;
-  };
+  const cached = (path: TPeerLinkPath): boolean =>
+    peerLinkFailureCache.has(options.target, path, now());
   const cache = (path: TPeerLinkPath, error: unknown): void => {
     const reason = classify(error);
-    const ttl = failureTtlMs(reason);
-    if (ttl > 0) failedUntil.set(path, now() + ttl);
+    peerLinkFailureCache.set(options.target, path, reason, now());
     emit({ type: "failed", path, reason, reused: false });
   };
   const release = (
@@ -225,7 +255,11 @@ export const createPeerLink = (options: TPeerLinkOptions) => {
     }
   };
 
-  return { channel, attempt, clearFailures: (): void => failedUntil.clear() };
+  return {
+    channel,
+    attempt,
+    clearFailures: (): void => peerLinkFailureCache.clear(options.target),
+  };
 };
 
 export const peerLinkFailureTtl = failureTtlMs;
