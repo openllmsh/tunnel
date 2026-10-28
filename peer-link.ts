@@ -15,6 +15,7 @@ export type TPeerLinkRtcMode = "use-if-open+warm" | "probe";
 export type TPeerLinkFailureReason =
   | "aborted"
   | "not_capable"
+  | "daemon_outdated"
   | "overloaded"
   | "tunnel_busy"
   | "transport"
@@ -68,6 +69,14 @@ export type TPeerLinkChannel = {
   readonly release: () => void;
 };
 
+export type TPeerLink = {
+  readonly channel: () => Promise<TPeerLinkChannel | null>;
+  readonly attempt: <T>(
+    fn: (resolved: TPeerLinkChannel) => Promise<T>,
+  ) => Promise<T>;
+  readonly clearFailures: () => void;
+};
+
 const failureTtlMs = (reason: TPeerLinkFailureReason): number => {
   switch (reason) {
     case "aborted":
@@ -76,6 +85,7 @@ const failureTtlMs = (reason: TPeerLinkFailureReason): number => {
     case "tunnel_busy":
       return 2_000;
     case "not_capable":
+    case "daemon_outdated":
       return 5_000;
     default:
       return PEER_LINK_DEFAULTS.failureTtlMs;
@@ -129,12 +139,15 @@ export const peerLinkFailureCache = {
   },
 };
 
-const defaultReasonOf = (error: unknown): TPeerLinkFailureReason => {
+export const peerLinkFailureReasonOf = (
+  error: unknown,
+): TPeerLinkFailureReason => {
   if (error instanceof DOMException && error.name === "AbortError") {
     return "aborted";
   }
   if (!(error instanceof Error)) return "unknown";
   if (error.message.includes("not_capable")) return "not_capable";
+  if (error.message.includes("daemon_outdated")) return "daemon_outdated";
   if (error.message.includes("overloaded")) return "overloaded";
   if (error.message.includes("tunnel_busy")) return "tunnel_busy";
   return "transport";
@@ -144,7 +157,7 @@ const defaultReasonOf = (error: unknown): TPeerLinkFailureReason => {
  * Sans-I/O RTC-first channel ladder. Hosts provide their RTC and relay mechanics;
  * this module owns selection, bounded probing, negative caching and idle release.
  */
-export const createPeerLink = (options: TPeerLinkOptions) => {
+export const createPeerLink = (options: TPeerLinkOptions): TPeerLink => {
   const now = options.policy?.now ?? Date.now;
   const rtcMode = options.policy?.rtcMode ?? "use-if-open+warm";
   const openBudgetMs =
@@ -152,7 +165,7 @@ export const createPeerLink = (options: TPeerLinkOptions) => {
   const rtcProbeMs =
     options.policy?.rtcProbeMs ?? Math.min(2_000, openBudgetMs);
   const idleTtlMs = options.policy?.idleTtlMs ?? PEER_LINK_DEFAULTS.idleTtlMs;
-  const classify = options.policy?.classifyFailure ?? defaultReasonOf;
+  const classify = options.policy?.classifyFailure ?? peerLinkFailureReasonOf;
   const retrySafe = options.policy?.retrySafe ?? (() => true);
   const idleTimers = new Map<TMuxChannel, ReturnType<typeof setTimeout>>();
 

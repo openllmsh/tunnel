@@ -66,6 +66,7 @@ export const rtcDuplex = (dc: TRtcDataChannelLike): TDuplex => {
   const drainListeners = new Set<() => void>();
   let peerGone = false;
   let channelClosed = false;
+  let drainPoll: ReturnType<typeof setInterval> | null = null;
   const highWaterMark = 1024 * 1024;
   const lowWaterMark = highWaterMark / 2;
   try {
@@ -74,9 +75,16 @@ export const rtcDuplex = (dc: TRtcDataChannelLike): TDuplex => {
     // werift versions without the DOM setter still expose bufferedAmount.
   }
 
+  const stopDrainPoll = (): void => {
+    if (drainPoll === null) return;
+    clearInterval(drainPoll);
+    drainPoll = null;
+  };
+
   const closeChannel = (): void => {
     if (channelClosed) return;
     channelClosed = true;
+    stopDrainPoll();
     try {
       dc.close();
     } catch {
@@ -106,6 +114,7 @@ export const rtcDuplex = (dc: TRtcDataChannelLike): TDuplex => {
     // deliver terminal null after the local side already closed the channel.
     if (channelClosed || peerGone) return;
     peerGone = true;
+    stopDrainPoll();
     // Deliver AFTER flipping peerGone so re-entrant close is a no-op, but the
     // terminal null still reaches the mux.
     deliver(null);
@@ -115,11 +124,23 @@ export const rtcDuplex = (dc: TRtcDataChannelLike): TDuplex => {
     for (const callback of drainListeners) callback();
   };
 
-  if (typeof dc.addEventListener === "function") {
-    dc.addEventListener("message", onMessage);
-    dc.addEventListener("close", onPeerGone);
-    dc.addEventListener("error", onPeerGone);
-    dc.addEventListener("bufferedamountlow", onBufferedAmountLow);
+  const supportsDrainEvent = typeof dc.addEventListener === "function";
+  const startDrainPoll = (): void => {
+    if (supportsDrainEvent || drainPoll !== null) return;
+    drainPoll = setInterval(() => {
+      if (channelClosed || peerGone || drainListeners.size === 0) {
+        stopDrainPoll();
+        return;
+      }
+      if (dc.bufferedAmount <= lowWaterMark) onBufferedAmountLow();
+    }, 25);
+  };
+
+  if (supportsDrainEvent) {
+    dc.addEventListener?.("message", onMessage);
+    dc.addEventListener?.("close", onPeerGone);
+    dc.addEventListener?.("error", onPeerGone);
+    dc.addEventListener?.("bufferedamountlow", onBufferedAmountLow);
   } else {
     dc.onmessage = onMessage;
     dc.onclose = onPeerGone;
@@ -148,7 +169,11 @@ export const rtcDuplex = (dc: TRtcDataChannelLike): TDuplex => {
     highWaterMark,
     onDrain: (callback) => {
       drainListeners.add(callback);
-      return () => drainListeners.delete(callback);
+      startDrainPoll();
+      return () => {
+        drainListeners.delete(callback);
+        if (drainListeners.size === 0) stopDrainPoll();
+      };
     },
     onBytes: (callback) => {
       listener = callback;
