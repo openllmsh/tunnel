@@ -12,6 +12,7 @@ export * from "./device-anchor";
 export * from "./device-control";
 export * from "./device-grant";
 export * from "./mux";
+export * from "./peer-link";
 export * from "./rtc-auth";
 export * from "./rtc-duplex";
 export * from "./secure";

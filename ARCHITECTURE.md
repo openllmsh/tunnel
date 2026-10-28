@@ -11,6 +11,7 @@
 | `codec.ts` | Frozen binary frame layout and bounded JSON/window helpers; codec-only relay subpath (`@openllmsh/tunnel/codec`) | Stream semantics or payload schemas |
 | `channel-envelope.ts` | 16-byte channel-UUID wrapper around one whole relay-WS mux message (`mux2`), so one relay socket multiplexes several channels | Mux stream/flow semantics or payload schemas |
 | `mux.ts` | Per-stream credits, lifecycle, parity, backpressure; optional sender-side `maxPayloadBytes` for SCTP-sized transports | Tunnel payload shape or host I/O |
+| `peer-link.ts` | Sans-I/O RTC-first peer-link policy: selection, bounded probe budgets, negative-cache classification, pre-dispatch retry safety and idle retention | Browser, daemon, relay, WebSocket or RTC implementation details |
 | `streams.ts` | OPEN/CTRL/RESET helpers and fetch-shaped tunnel stream APIs (`tunnelStream` / `serveStream`) | Relay routing and WebSocket mechanics |
 | `stream-reset-error.ts` | Typed application-level reset error | Mux lifecycle or protocol parsing |
 | `device-grant.ts` | Canonical device-grant envelope encode/decode + message bytes (no crypto) | Vault DEK, node:crypto, host I/O |
