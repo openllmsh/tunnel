@@ -39,6 +39,8 @@ export type TPeerLinkDialer = {
     timeoutMs: number,
     signal: AbortSignal,
   ) => Promise<TMuxChannel | null>;
+  /** Release a healthy channel after it has been idle for the configured TTL. */
+  readonly release?: (channel: TMuxChannel) => void;
   /** Host teardown hook for a channel that failed before dispatch. */
   readonly drop?: (channel: TMuxChannel) => void;
 };
@@ -211,7 +213,7 @@ export const createPeerLink = (options: TPeerLinkOptions): TPeerLink => {
       channel,
       setTimeout(() => {
         idleTimers.delete(channel);
-        if (channel.openStreamCount() === 0) dialer.drop?.(channel);
+        if (channel.openStreamCount() === 0) dialer.release?.(channel);
       }, idleTtlMs),
     );
     emit({ type: "released", path, reused: true });
@@ -325,7 +327,8 @@ export const createPeerLink = (options: TPeerLinkOptions): TPeerLink => {
     } catch (error) {
       if (!retrySafe(error)) throw error;
       cache(resolved.path, error);
-      resolved.release();
+      const dialer = resolved.path === "rtc" ? options.rtc : options.mux;
+      dialer?.drop?.(resolved.channel);
       if (resolved.path !== "rtc") throw error;
       emit({
         type: "fallback",
