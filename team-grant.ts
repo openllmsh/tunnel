@@ -136,14 +136,30 @@ export const encodeTeamGrant = (envelope: TTeamGrantEnvelope): string =>
     "team grant exceeds TEAM_GRANT_B64_MAX",
   );
 
+/** Every key a grant envelope may carry; anything else is refused. */
+const TEAM_GRANT_KEYS: ReadonlySet<string> = new Set([
+  "v",
+  "team_id",
+  "share_id",
+  "consumer",
+  "device_user_id",
+  "device_key_id",
+  "model",
+  "n",
+  "exp",
+  "cap_tokens",
+  "sig",
+]);
+
 /**
- * Strict decode of known fields. Extra JSON keys are tolerated (forward
- * compatible) but never returned. Returns null on any known-field mismatch
- * (including rejected v1 envelopes).
+ * Strict decode. An unknown key is refused, never ignored: a future
+ * restriction an older peer can't read must fail closed. Returns null on any
+ * unknown key or field mismatch (including rejected v1 envelopes).
  */
 export const decodeTeamGrant = (b64: string): TTeamGrantEnvelope | null => {
   const o = decodeB64Json(b64, TEAM_GRANT_B64_MAX);
   if (o === null) return null;
+  if (Object.keys(o).some((key) => !TEAM_GRANT_KEYS.has(key))) return null;
   if (o.v !== TEAM_GRANT_VERSION) return null;
   if (!isNonEmptyString(o.team_id)) return null;
   if (!isNonEmptyString(o.share_id)) return null;

@@ -354,5 +354,3 @@ export const createPeerLink = (options: TPeerLinkOptions): TPeerLink => {
     clearFailures: (): void => peerLinkFailureCache.clear(options.target),
   };
 };
-
-export const peerLinkFailureTtl = failureTtlMs;
