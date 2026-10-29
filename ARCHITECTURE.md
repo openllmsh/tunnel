@@ -93,7 +93,8 @@ enveloped (no relay hop — the data channel itself is the channel).
 
 **P2: agent-sessions E2E (in this release):**
 
-- `secure.ts` — Noise_IK duplex wrapper (P2). Secures the mux fallback for
+- `secure.ts` — Noise_IK duplex wrapper (P2), with optional 32-byte PSK
+  selecting Noise_IKpsk2 and `deriveTeamTunnelPsk` for team-key HKDF. Secures the mux fallback for
   agent streams (browser path when RTC unavailable or forced off).
   `secureMuxStream` encrypts DATA (length-prefixed Noise records) and CTRL
   (separate key pair); RESET / END / WINDOW stay plaintext. The frozen

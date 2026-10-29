@@ -47,6 +47,7 @@ import { encodeJsonPayload } from "./codec";
 import type { TDuplex, TMuxEventHandler, TMuxStream } from "./mux";
 
 export const NOISE_PROTOCOL_NAME = "Noise_IK_25519_AESGCM_SHA256";
+export const NOISE_PSK_PROTOCOL_NAME = "Noise_IKpsk2_25519_AESGCM_SHA256";
 export const NOISE_DH_LEN = 32;
 export const NOISE_TAG_LEN = 16;
 /** Noise spec limit on one handshake or transport message. */
@@ -117,6 +118,8 @@ export type TSecureAuthorizeContext = {
 type TSecureCommonOptions = {
   /** Bound into the handshake hash; both sides must agree. */
   readonly prologue?: Uint8Array;
+  /** Optional 32-byte pre-shared key; selects Noise IKpsk2. */
+  readonly psk?: Uint8Array;
   readonly timeoutMs?: number;
   readonly signal?: AbortSignal;
 };
@@ -327,6 +330,28 @@ const hmac = async (key: Uint8Array, data: Uint8Array): Promise<Uint8Array> => {
   return new Uint8Array(await subtle().sign("HMAC", k, own(data)));
 };
 
+/** Derive the team-specific Noise PSK from the team key. */
+export const deriveTeamTunnelPsk = async (
+  teamKey: Uint8Array,
+  teamId: string,
+): Promise<Uint8Array> => {
+  const key = await subtle().importKey("raw", own(teamKey), "HKDF", false, [
+    "deriveBits",
+  ]);
+  return new Uint8Array(
+    await subtle().deriveBits(
+      {
+        name: "HKDF",
+        hash: "SHA-256",
+        salt: own(new TextEncoder().encode(teamId)),
+        info: own(new TextEncoder().encode("openllm-team-tunnel-psk-v1")),
+      },
+      key,
+      256,
+    ),
+  );
+};
+
 /** Noise HKDF with two outputs. */
 const hkdf2 = async (
   chainingKey: Uint8Array,
@@ -413,8 +438,14 @@ type TSymmetricState = {
 
 const initSymmetric = async (
   prologue: Uint8Array,
+  psk?: Uint8Array,
 ): Promise<TSymmetricState> => {
-  const name = new TextEncoder().encode(NOISE_PROTOCOL_NAME);
+  if (psk !== undefined && psk.byteLength !== 32) {
+    throw new SecureChannelError("malformed", "Noise PSK must be 32 bytes");
+  }
+  const name = new TextEncoder().encode(
+    psk === undefined ? NOISE_PROTOCOL_NAME : NOISE_PSK_PROTOCOL_NAME,
+  );
   const h = new Uint8Array(32);
   if (name.byteLength <= 32) h.set(name);
   else h.set(await sha256(name));
@@ -436,6 +467,19 @@ const mixKey = async (
 ): Promise<void> => {
   const [ck, tempK] = await hkdf2(state.ck, ikm);
   state.ck = ck;
+  state.cs = cipherState(await aesKey(tempK));
+};
+
+const mixKeyAndHash = async (
+  state: TSymmetricState,
+  psk: Uint8Array,
+): Promise<void> => {
+  const temp = await hmac(state.ck, psk);
+  const ck = await hmac(temp, new Uint8Array([1]));
+  const tempH = await hmac(temp, concatBytes(ck, new Uint8Array([2])));
+  const tempK = await hmac(temp, concatBytes(tempH, new Uint8Array([3])));
+  state.ck = ck;
+  await mixHash(state, tempH);
   state.cs = cipherState(await aesKey(tempK));
 };
 
@@ -524,12 +568,13 @@ const runInitiator = async (
   const s = options.localStatic ?? (await generateNoiseStaticKey());
   const payload = options.payload ?? new Uint8Array();
   checkPayloadSize(payload);
-  const state = await initSymmetric(prologueOf(options));
+  const state = await initSymmetric(prologueOf(options), options.psk);
   await mixHash(state, rs);
 
   // -> e, es, s, ss
   const e = await generateNoiseStaticKey();
   await mixHash(state, e.publicKey);
+  if (options.psk !== undefined) await mixKey(state, e.publicKey);
   await mixKey(state, await e.dh(rs));
   const encryptedStatic = await encryptAndHash(state, s.publicKey);
   await mixKey(state, await s.dh(rs));
@@ -543,8 +588,10 @@ const runInitiator = async (
   }
   const re = reply.slice(0, NOISE_DH_LEN);
   await mixHash(state, re);
+  if (options.psk !== undefined) await mixKey(state, re);
   await mixKey(state, await e.dh(re));
   await mixKey(state, await s.dh(re));
+  if (options.psk !== undefined) await mixKeyAndHash(state, options.psk);
   const peerPayload = await decryptAndHash(state, reply.subarray(NOISE_DH_LEN));
   return {
     remoteStatic: rs,
@@ -559,7 +606,7 @@ const runResponder = async (
   options: TSecureResponderOptions,
 ): Promise<THandshakeResult> => {
   const s = options.localStatic;
-  const state = await initSymmetric(prologueOf(options));
+  const state = await initSymmetric(prologueOf(options), options.psk);
   await mixHash(state, s.publicKey);
 
   // -> e, es, s, ss
@@ -570,6 +617,7 @@ const runResponder = async (
   }
   const re = first.slice(0, NOISE_DH_LEN);
   await mixHash(state, re);
+  if (options.psk !== undefined) await mixKey(state, re);
   await mixKey(state, await s.dh(re));
   const rs = await decryptAndHash(
     state,
@@ -592,8 +640,10 @@ const runResponder = async (
   // <- e, ee, se
   const e = await generateNoiseStaticKey();
   await mixHash(state, e.publicKey);
+  if (options.psk !== undefined) await mixKey(state, e.publicKey);
   await mixKey(state, await e.dh(re));
   await mixKey(state, await e.dh(rs));
+  if (options.psk !== undefined) await mixKeyAndHash(state, options.psk);
   const encryptedPayload = await encryptAndHash(state, reply);
   pipe.send(concatBytes(e.publicKey, encryptedPayload));
   return {
