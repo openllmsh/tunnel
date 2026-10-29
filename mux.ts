@@ -288,7 +288,7 @@ export const createChannel = (options: TCreateChannelOptions): TMuxChannel => {
         let sent = false;
         let lastSentIndex: number | null = null;
         for (let offset = 0; offset < pendingStates.length; offset += 1) {
-          if (transportBackpressured()) break;
+          if (closed || transportBackpressured()) break;
           const index = (start + offset) % pendingStates.length;
           const state = pendingStates[index];
           const pending = state.pending[0];
