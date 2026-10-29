@@ -129,6 +129,12 @@ export const peerLinkFailureCache = {
       if (key.startsWith(`${target}\u0000`)) failureCache.delete(key);
     }
   },
+  /** Clear one transport's failures without erasing the independent rung. */
+  clearPath(path: TPeerLinkPath): void {
+    for (const key of failureCache.keys()) {
+      if (key.endsWith(`\u0000${path}`)) failureCache.delete(key);
+    }
+  },
   has(target: string, path: TPeerLinkPath, now = Date.now()): boolean {
     const key = cacheKeyOf(target, path);
     const until = failureCache.get(key);
